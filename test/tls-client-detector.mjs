@@ -52,7 +52,7 @@ function normalizeNode(node, content) {
   const spans = nodes(node).filter(n => n.type === "Literal" || n.type === "TemplateElement")
     .sort((a, b) => a.start - b.start);
   const plain = text => text.replace(/\s+/g, " ").replace(/\(\s+/g, "(")
-    .replace(/,\s*\)/g, ")").replace(/\s+\)/g, ")");
+    .replace(/,\s*([)}])/g, "$1").replace(/\s+([)}])/g, "$1");
   let end = node.start, text = "";
   for (const span of spans) {
     if (span.start < end) continue;
@@ -71,7 +71,7 @@ export function findRawTlsClients(content, file = "source.js") {
     throw new SyntaxError(file + ": " + error.message, { cause: error });
   }
   const list = nodes(tree);
-  const bindings = new Map(Object.keys(CLIENTS).map(name => [name, name]));
+  const bindings = new Map([...Object.keys(CLIENTS), "globalThis"].map(name => [name, name]));
   const requireNames = new Set(["require", "__require"]);
   const requireFactories = new Set();
   const builtinNames = new Set();
@@ -83,6 +83,8 @@ export function findRawTlsClients(content, file = "source.js") {
     if (node?.type === "CallExpression") {
       const callee = unwrap(node.callee);
       const name = member(callee) ?? callee.name;
+      if (name === "get" && unwrap(callee.object)?.name === "Reflect"
+        && kind(node.arguments[0]) === "globalThis" && literal(node.arguments[1]) === "Bun") return "Bun";
       const factory = callee.type === "CallExpression" && requireFactories.has(callee.callee.name);
       const call = member(callee) === "call" && requireNames.has(callee.object?.name);
       if (requireNames.has(name) || name === "getBuiltinModule" || builtinNames.has(name) || factory || call) {
@@ -90,8 +92,8 @@ export function findRawTlsClients(content, file = "source.js") {
       }
     }
     if (node?.type === "MemberExpression") {
-      if (node.object.name === "globalThis") return bindings.get(member(node));
       const base = kind(node.object), property = member(node);
+      if (base === "globalThis") return bindings.get(property);
       if (CLIENTS[base]?.has(property)) return base + "#" + property;
       if (base?.includes("#") && (property === "call" || property === "apply")) return base;
     }
@@ -121,7 +123,7 @@ export function findRawTlsClients(content, file = "source.js") {
       if (node.id.type === "Identifier") bind(node.id.name, value);
       if (node.id.type === "ObjectPattern") for (const prop of node.id.properties) {
         const name = prop.key?.name ?? literal(prop.key);
-        if (value === "process" && name === "getBuiltinModule") builtinNames.add(prop.value.name);
+        if (node.init.type === "Identifier" && node.init.name === "process" && name === "getBuiltinModule") builtinNames.add(prop.value.name);
         if (name === "default" && CLIENTS[value]) bind(prop.value.name, value);
         else if (CLIENTS[value]?.has(name)) bind(prop.value.name, value + "#" + name);
       }
@@ -141,7 +143,7 @@ export function findRawTlsClients(content, file = "source.js") {
     if (["ImportDeclaration", "ExportNamedDeclaration", "ExportAllDeclaration"].includes(node.type)
       && CLIENTS[literal(node.source)?.replace(/^node:/, "")]) add(node);
     if (node.type === "ImportExpression" && CLIENTS[kind(node)]) add(node);
-    if (node.type === "CallExpression" && CLIENTS[kind(node)]) add(node);
+    if (node.type === "CallExpression" && CLIENTS[kind(node)] && kind(node) !== "Bun") add(node);
     if (["CallExpression", "NewExpression"].includes(node.type)) {
       const value = kind(node.callee);
       const [base, property] = value?.split("#") ?? [];
@@ -170,9 +172,11 @@ export function isScannedSourceFile(file) {
 export function evaluateShippedSource(scan, allowlist) {
   const offenders = [];
   const counts = new Map(allowlist.map(entry => [entry, 0]));
+  const calls = new Map(allowlist.map(entry => [entry,
+    normalizeNode(parse(entry.call, { ecmaVersion: "latest", sourceType: "module" }), entry.call)]));
   for (const item of scan) {
     for (const hit of findRawTlsClients(item.content, item.path)) {
-      const entry = allowlist.find(candidate => candidate.file === item.path && candidate.call === hit.text);
+      const entry = allowlist.find(candidate => candidate.file === item.path && calls.get(candidate) === hit.text);
       if (entry) counts.set(entry, counts.get(entry) + 1);
       else offenders.push(`${item.path}:${hit.line}  ${hit.text}`);
     }

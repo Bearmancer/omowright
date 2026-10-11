@@ -11,9 +11,49 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 // OmOWright supplies headers only. See senpi#3078 and oh-my-openagent#9892.
 // Entries must pin { file, call: exact normalized text, count, reason }.
 // Empty today: dependency bundles are reviewed separately, not file-exempted.
+// Known limits: createRequire through namespace/default module imports or
+// require("node:module") chains; require.apply, require aliases/sequence calls;
+// detached getBuiltinModule aliases/.call; variable Bun keys; globalThis Bun
+// destructuring; variable/const-folded module specifiers; Reflect.get(Bun, "connect").
+// This is a regression guard, not a complete data-flow or evasion detector.
 const ALLOWLIST = [];
 
 describe("raw TLS client guard (CVE-2026-48618)", () => {
+  // Security regression: in-tree runtime access must expose the client, not just its global lookup.
+  for (const { name, sample } of [
+  {
+    "name": "global alias",
+    "sample": "const target = globalThis; target.Bun?.connect(o);"
+  },
+  {
+    "name": "Reflect direct",
+    "sample": "Reflect.get(globalThis, \"Bun\")?.connect(o);"
+  },
+  {
+    "name": "Reflect alias",
+    "sample": "const target = globalThis; Reflect.get(target, \"Bun\").connect(o);"
+  },
+  {
+    "name": "process destructure",
+    "sample": "const { getBuiltinModule: g } = process; g(\"node:tls\");"
+  }
+]) {
+    it("detects the AST-round " + name + " client", () => {
+      assert.ok(findRawTlsClients(sample).some(hit => name === "process destructure" ? hit.text === 'g("node:tls")' : hit.text.endsWith("connect(o)")), sample);
+    });
+  }
+  it("keeps non-client Bun lookups and unrelated Reflect receivers clean", () => {
+    for (const sample of ['const target = globalThis; const bun = Reflect.get(target, "Bun"); bun?.hash(value);', 'const local = {}; Reflect.get(local, "Bun").connect(o);'])
+      assert.deepEqual(findRawTlsClients(sample), []);
+  });
+  it("preserves object trailing-comma reflows without changing literals or counts", () => {
+    const entry = { file: "src/client.js", call: 'tls.connect({ host: u.hostname, options: { servername: u.hostname, label: "comma, }" } })', count: 2, reason: "URL-parsed host" };
+    const content = entry.call + ';\n tls.connect({ host: u.hostname, options: { servername: u.hostname, label: "comma, }", }, },);';
+    const scan = [{ path: entry.file, content }];
+    assert.deepEqual(evaluateShippedSource(scan, [entry]), { offenders: [], stale: [] });
+    assert.ok(evaluateShippedSource([{ path: entry.file, content: content + entry.call }], [entry]).stale.length);
+    assert.ok(evaluateShippedSource([{ path: entry.file, content: content.replace('comma, }', 'comma,}') }], [entry]).offenders.length);
+  });
 
   it("detects Bun destructuring assignment", () => {
     assert.ok(findRawTlsClients("let connect; ({ connect } = Bun); connect({ tls: true });").length);
@@ -75,7 +115,7 @@ describe("raw TLS client guard (CVE-2026-48618)", () => {
       assert.throws(() => evaluateShippedSource([{ path: "src/broken.js", content }], []), /src\/broken\.js/);
     }
   });
-  it("detects every direct client and module acquisition form", () => {
+  it("detects sampled direct clients and module acquisitions", () => {
     const samples = [
       'import { createServer } from "node:https";',
       'export { createSecureServer } from "node:http2";',
@@ -118,7 +158,7 @@ describe("raw TLS client guard (CVE-2026-48618)", () => {
       assert.ok(findRawTlsClients(sample).length > 0, `missed: ${sample}`);
     }
     assert.deepEqual(findRawTlsClients('\n\ntls.connect({ host: "x)" });'), [
-      { line: 3, text: 'tls.connect({ host: "x)" })' },
+      { line: 3, text: 'tls.connect({ host: "x)"})' },
     ]);
     assert.deepEqual(findRawTlsClients("Bun.connect(options)"), [
       { line: 1, text: "Bun.connect(options)" },
