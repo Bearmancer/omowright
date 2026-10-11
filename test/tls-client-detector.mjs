@@ -136,6 +136,8 @@ export function findRawTlsClients(content, file = "source.js") {
     hits.push({ line: node.loc.start.line, text: normalizeNode(node, content) });
   };
   for (const node of list) {
+    if (node.type === "AssignmentExpression" && node.left.type === "ObjectPattern" && kind(node.right) === "Bun"
+      && node.left.properties.some(p => (p.key?.name ?? literal(p.key)) === "connect")) add(node);
     if (["ImportDeclaration", "ExportNamedDeclaration", "ExportAllDeclaration"].includes(node.type)
       && CLIENTS[literal(node.source)?.replace(/^node:/, "")]) add(node);
     if (node.type === "ImportExpression" && CLIENTS[kind(node)]) add(node);

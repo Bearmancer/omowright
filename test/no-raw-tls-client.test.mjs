@@ -15,6 +15,10 @@ const ALLOWLIST = [];
 
 describe("raw TLS client guard (CVE-2026-48618)", () => {
 
+  it("detects Bun destructuring assignment", () => {
+    assert.ok(findRawTlsClients("let connect; ({ connect } = Bun); connect({ tls: true });").length);
+  });
+
   it("detects calls independently of their module acquisition pins", () => {
     for (const [sample, call] of [
   [
