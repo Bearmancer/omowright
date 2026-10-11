@@ -1,104 +1,150 @@
-const MODULES = new Set(["tls", "https", "http2"]);
+import { parse } from "acorn";
+
 const CLIENTS = {
-  tls: new Set(["connect", "TLSSocket", "checkServerIdentity"]),
+  tls: new Set(["connect", "createConnection", "TLSSocket", "createSecureContext", "checkServerIdentity"]),
   https: new Set(["request", "get", "Agent", "globalAgent"]),
   http2: new Set(["connect"]),
   Bun: new Set(["connect"]),
 };
 
-export function normalizeCallText(text) {
-  return text.replace(/\s+/g, " ").replace(/\(\s+/g, "(")
+function nodes(tree) {
+  const result = [];
+  const visit = node => {
+    if (!node || typeof node.type !== "string") return;
+    result.push(node);
+    for (const value of Object.values(node)) {
+      if (Array.isArray(value)) value.forEach(visit);
+      else if (value && typeof value === "object") visit(value);
+    }
+  };
+  visit(tree);
+  return result;
+}
+
+function literal(node) {
+  if (node?.type === "Literal" && typeof node.value === "string") return node.value;
+  if (node?.type === "TemplateLiteral") {
+    let value = node.quasis[0].value.cooked;
+    for (let i = 0; i < node.expressions.length; i++) {
+      const part = literal(node.expressions[i]);
+      if (part === undefined) return undefined;
+      value += part + node.quasis[i + 1].value.cooked;
+    }
+    return value;
+  }
+  if (node?.type === "BinaryExpression" && node.operator === "+") {
+    const left = literal(node.left), right = literal(node.right);
+    if (left !== undefined && right !== undefined) return left + right;
+  }
+}
+
+function unwrap(node) {
+  return node?.type === "ChainExpression" ? unwrap(node.expression) : node;
+}
+
+function member(node) {
+  node = unwrap(node);
+  if (node?.type !== "MemberExpression") return undefined;
+  return node.computed ? literal(node.property) : node.property.name;
+}
+
+function normalizeNode(node, content) {
+  const spans = nodes(node).filter(n => n.type === "Literal" || n.type === "TemplateElement")
+    .sort((a, b) => a.start - b.start);
+  const plain = text => text.replace(/\s+/g, " ").replace(/\(\s+/g, "(")
     .replace(/,\s*\)/g, ")").replace(/\s+\)/g, ")");
+  let end = node.start, text = "";
+  for (const span of spans) {
+    if (span.start < end) continue;
+    text += plain(content.slice(end, span.start)) + content.slice(span.start, span.end);
+    end = span.end;
+  }
+  return (text + plain(content.slice(end, node.end))).trim().replace(/;$/, "");
 }
 
-function literal(token) {
-  if (!token || !/^["'`]/.test(token.text)) return null;
-  return token.text.slice(1, -1)
-    .replace(/\\u\{([0-9a-f]+)\}|\\u([0-9a-f]{4})|\\x([0-9a-f]{2})/gi,
-      (_, wide, unicode, hex) => String.fromCodePoint(parseInt(wide ?? unicode ?? hex, 16)))
-    .replace(/\\(["'`\\])/g, "$1");
-}
-
-function tokens(content) {
-  const pattern = /\/\/[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|[A-Za-z_$][\w$]*|[^\s]/g;
-  return [...content.matchAll(pattern)]
-    .filter(match => !match[0].startsWith("//") && !match[0].startsWith("/*"))
-    .map(match => ({ text: match[0], index: match.index }));
-}
-
-function grantsClient(clause, module) {
-  if (module === "tls") return true;
-  if (clause.some(token => token.text === "*")) return true;
-  const open = clause.findIndex(token => token.text === "{");
-  if (open !== 0) return true; // Default import, including default plus named.
-  let atStart = true;
-  for (let i = 1; i < clause.length; i += 1) {
-    const text = clause[i].text;
-    if (text === ",") atStart = true;
-    else if (atStart) {
-      atStart = false;
-      if (text !== "type" && CLIENTS[module].has(literal(clause[i]) ?? text)) return true;
+export function findRawTlsClients(content, file = "source.js") {
+  let tree;
+  try {
+    tree = parse(content, { ecmaVersion: "latest", sourceType: "module", locations: true,
+      allowAwaitOutsideFunction: true, allowReturnOutsideFunction: true });
+  } catch (error) {
+    throw new SyntaxError(file + ": " + error.message, { cause: error });
+  }
+  const list = nodes(tree);
+  const bindings = new Map(Object.keys(CLIENTS).map(name => [name, name]));
+  const requireNames = new Set(["require"]);
+  const builtinNames = new Set();
+  const kind = expression => {
+    const node = unwrap(expression);
+    if (node?.type === "Identifier") return bindings.get(node.name);
+    if (node?.type === "AwaitExpression") return kind(node.argument);
+    if (node?.type === "ImportExpression") return literal(node.source)?.replace(/^node:/, "");
+    if (node?.type === "CallExpression") {
+      const callee = unwrap(node.callee);
+      const name = member(callee) ?? callee.name;
+      if (requireNames.has(name) || name === "getBuiltinModule" || builtinNames.has(name)) {
+        return literal(node.arguments[0])?.replace(/^node:/, "");
+      }
+    }
+    if (node?.type === "MemberExpression") {
+      if (node.object.name === "globalThis") return bindings.get(member(node));
+      const base = kind(node.object), property = member(node);
+      if (CLIENTS[base]?.has(property)) return base + "#" + property;
+    }
+  };
+  for (const node of list) {
+    if (node.type !== "ImportDeclaration") continue;
+    const specifier = literal(node.source), module = specifier?.replace(/^node:/, "");
+    for (const spec of node.specifiers) {
+      const imported = spec.imported?.name ?? spec.imported?.value;
+      if (module === "module" && imported === "createRequire") requireNames.add(spec.local.name);
+      if (CLIENTS[module]) bindings.set(spec.local.name,
+        imported && imported !== "default" ? module + "#" + imported : module);
     }
   }
-  return false;
-}
-
-export function findRawTlsClients(content) {
-  const list = tokens(content);
-  const hits = [];
-  const add = (start, end) => {
-    hits.push({
-      line: content.slice(0, list[start].index).split("\n").length,
-      text: normalizeCallText(content.slice(list[start].index, list[end].index + list[end].text.length)),
-    });
-  };
-  const callEnd = open => {
-    let depth = 0;
-    for (let i = open; i < list.length; i += 1) {
-      if (list[i].text === "(") depth += 1;
-      if (list[i].text === ")" && --depth === 0) return i;
-    }
-    return list.length - 1;
-  };
-  for (let i = 0; i < list.length; i += 1) {
-    const text = list[i].text;
-    const next = list[i + 1]?.text;
-    if (Object.hasOwn(CLIENTS, text)) {
-      let property, open;
-      if (next === ".") {
-        property = list[i + 2]?.text;
-        open = i + 3;
-      } else if (next === "[" && list[i + 3]?.text === "]") {
-        property = literal(list[i + 2]);
-        open = i + 4;
+  let changed;
+  do {
+    changed = false;
+    const bind = (name, value) => {
+      if (value && !bindings.has(name)) { bindings.set(name, value); changed = true; }
+    };
+    for (const node of list) {
+      if (node.type !== "VariableDeclarator" || !node.init) continue;
+      if (node.init.type === "CallExpression" && requireNames.has(node.init.callee.name)) {
+        requireNames.add(node.id.name);
       }
-      if (CLIENTS[text].has(property) && list[open]?.text === "(") {
-        add(list[i - 1]?.text === "new" ? i - 1 : i, callEnd(open));
+      const value = kind(node.init);
+      if (node.id.type === "Identifier") bind(node.id.name, value);
+      if (node.id.type === "ObjectPattern") for (const prop of node.id.properties) {
+        const name = prop.key?.name ?? literal(prop.key);
+        if (value === "process" && name === "getBuiltinModule") builtinNames.add(prop.value.name);
+        if (CLIENTS[value]?.has(name)) bind(prop.value.name, value + "#" + name);
       }
     }
-    if (text === "checkServerIdentity" && list[i + 1]?.text === ":") add(i, i);
-    const builtin = text === "process" && next === "." &&
-      list[i + 2]?.text === "getBuiltinModule" && list[i + 3]?.text === "(";
-    if ((text === "require" || text === "import") && next === "(" || builtin) {
-      const open = builtin ? i + 3 : i + 1;
-      const name = literal(list[open + 1])?.replace(/^node:/, "");
-      if (MODULES.has(name)) add(i, callEnd(open));
-      continue;
+  } while (changed);
+  const hits = [], seen = new Set();
+  const add = node => {
+    if (seen.has(node.start)) return;
+    seen.add(node.start);
+    hits.push({ line: node.loc.start.line, text: normalizeNode(node, content) });
+  };
+  for (const node of list) {
+    if (["ImportDeclaration", "ExportNamedDeclaration", "ExportAllDeclaration"].includes(node.type)
+      && CLIENTS[literal(node.source)?.replace(/^node:/, "")]) add(node);
+    if (node.type === "ImportExpression" && CLIENTS[kind(node)]) add(node);
+    if (node.type === "CallExpression" && CLIENTS[kind(node)]) add(node);
+    if (["CallExpression", "NewExpression"].includes(node.type)) {
+      const value = kind(node.callee);
+      const [base, property] = value?.split("#") ?? [];
+      if (CLIENTS[base]?.has(property)) add(node);
     }
-    if (text !== "import" && text !== "export") continue;
-    if (next === "type") continue;
-    const sideEffect = literal(list[i + 1])?.replace(/^node:/, "");
-    if (text === "import" && MODULES.has(sideEffect)) {
-      add(i, i + 1);
-      continue;
+    if (node.type === "MemberExpression" && kind(node) === "Bun#connect") {
+      if (node.parent?.type !== "CallExpression") add(node);
     }
-    for (let j = i + 1; j < list.length; j += 1) {
-      if ([";", "import", "export"].includes(list[j].text)) break;
-      if (list[j].text !== "from") continue;
-      const name = literal(list[j + 1])?.replace(/^node:/, "");
-      if (MODULES.has(name) && grantsClient(list.slice(i + 1, j), name)) add(i, j + 1);
-      break;
-    }
+    if (node.type === "VariableDeclarator" && node.id.type === "ObjectPattern" && kind(node.init) === "Bun"
+      && node.id.properties.some(p => (p.key?.name ?? literal(p.key)) === "connect")) add(node);
+    if (node.type === "Property" && (node.key.name ?? literal(node.key)) === "checkServerIdentity") add(node);
+    if (node.type === "AssignmentExpression" && member(node.left) === "checkServerIdentity") add(node);
   }
   return hits;
 }
@@ -116,7 +162,7 @@ export function evaluateShippedSource(scan, allowlist) {
   const offenders = [];
   const counts = new Map(allowlist.map(entry => [entry, 0]));
   for (const item of scan) {
-    for (const hit of findRawTlsClients(item.content)) {
+    for (const hit of findRawTlsClients(item.content, item.path)) {
       const entry = allowlist.find(candidate => candidate.file === item.path && candidate.call === hit.text);
       if (entry) counts.set(entry, counts.get(entry) + 1);
       else offenders.push(`${item.path}:${hit.line}  ${hit.text}`);

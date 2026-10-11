@@ -14,8 +14,33 @@ const root = fileURLToPath(new URL("../", import.meta.url));
 const ALLOWLIST = [];
 
 describe("raw TLS client guard (CVE-2026-48618)", () => {
+
+  it("catches reviewer H1 regex/templates and H2 acquisitions (security regression)", () => {
+    for (const sample of [
+  "const r = /\"/; tls.connect(o); const s = \"x\";",
+  "const r = /`/; tls.connect(o); const s = `x`;",
+  "const s = `${a ? `\"` : \"\"}`; tls.connect(o); const z = \"q\";",
+  "const r = /a\\/*/; tls.connect(o); /* */",
+  "import { default as h } from \"node:https\"; h.request(o);",
+  "export { default } from \"node:https\";",
+  "export { default as h } from \"node:http2\";",
+  "Bun?.connect({ tls: true });",
+  "const { connect } = Bun; connect({ tls: true });",
+  "const c = Bun.connect; c({ tls: true });",
+  "Bun.connect.call(null, { tls: true });",
+  "Bun.connect.apply(null, [{ tls: true }]);"
+]) assert.ok(findRawTlsClients(sample).length, sample);
+  });
+  it("fails closed and names malformed shipped source", () => {
+    for (const content of ['const s = "unterminated', 'const s = `unterminated', 'function f() {']) {
+      assert.throws(() => evaluateShippedSource([{ path: "src/broken.js", content }], []), /src\/broken\.js/);
+    }
+  });
   it("detects every direct client and module acquisition form", () => {
     const samples = [
+      'import { createServer } from "node:https";',
+      'export { createSecureServer } from "node:http2";',
+      "tls.createSecureContext(options)",
       "tls.connect({ host, port: 443 })",
       "https.request(url, callback)",
       "https.get(url)",
@@ -58,16 +83,11 @@ describe("raw TLS client guard (CVE-2026-48618)", () => {
     ]);
   });
 
-  it("ignores comments, literal prose, type-only and inbound neighbors", () => {
+  it("ignores comments, literal prose and calls to inbound neighbors", () => {
     for (const sample of [
       '// tls.connect(options)\n/* import client from "tls" */',
       'const text = "tls.connect(options)";',
       'const text = `import client from "tls";`;',
-      'import type { Agent } from "node:https";',
-      'export type { SecureContext } from "node:tls";',
-      'import { createServer } from "node:https";',
-      'export { createSecureServer } from "node:http2";',
-      'import { createServer, type Agent } from "node:https";',
       'import { connect } from "node:tlsx";',
       'import { connect } from "./tls";',
       "fetch(url); new URL(url); tls.createServer(options); Bun.serve(options);",
