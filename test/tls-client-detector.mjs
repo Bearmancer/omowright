@@ -72,7 +72,8 @@ export function findRawTlsClients(content, file = "source.js") {
   }
   const list = nodes(tree);
   const bindings = new Map(Object.keys(CLIENTS).map(name => [name, name]));
-  const requireNames = new Set(["require"]);
+  const requireNames = new Set(["require", "__require"]);
+  const requireFactories = new Set();
   const builtinNames = new Set();
   const kind = expression => {
     const node = unwrap(expression);
@@ -82,14 +83,17 @@ export function findRawTlsClients(content, file = "source.js") {
     if (node?.type === "CallExpression") {
       const callee = unwrap(node.callee);
       const name = member(callee) ?? callee.name;
-      if (requireNames.has(name) || name === "getBuiltinModule" || builtinNames.has(name)) {
-        return literal(node.arguments[0])?.replace(/^node:/, "");
+      const factory = callee.type === "CallExpression" && requireFactories.has(callee.callee.name);
+      const call = member(callee) === "call" && requireNames.has(callee.object?.name);
+      if (requireNames.has(name) || name === "getBuiltinModule" || builtinNames.has(name) || factory || call) {
+        return literal(node.arguments[call ? 1 : 0])?.replace(/^node:/, "");
       }
     }
     if (node?.type === "MemberExpression") {
       if (node.object.name === "globalThis") return bindings.get(member(node));
       const base = kind(node.object), property = member(node);
       if (CLIENTS[base]?.has(property)) return base + "#" + property;
+      if (base?.includes("#") && (property === "call" || property === "apply")) return base;
     }
   };
   for (const node of list) {
@@ -97,7 +101,7 @@ export function findRawTlsClients(content, file = "source.js") {
     const specifier = literal(node.source), module = specifier?.replace(/^node:/, "");
     for (const spec of node.specifiers) {
       const imported = spec.imported?.name ?? spec.imported?.value;
-      if (module === "module" && imported === "createRequire") requireNames.add(spec.local.name);
+      if (module === "module" && imported === "createRequire") requireFactories.add(spec.local.name);
       if (CLIENTS[module]) bindings.set(spec.local.name,
         imported && imported !== "default" ? module + "#" + imported : module);
     }
@@ -110,7 +114,7 @@ export function findRawTlsClients(content, file = "source.js") {
     };
     for (const node of list) {
       if (node.type !== "VariableDeclarator" || !node.init) continue;
-      if (node.init.type === "CallExpression" && requireNames.has(node.init.callee.name)) {
+      if (node.init.type === "CallExpression" && requireFactories.has(node.init.callee.name)) {
         requireNames.add(node.id.name);
       }
       const value = kind(node.init);
@@ -118,11 +122,14 @@ export function findRawTlsClients(content, file = "source.js") {
       if (node.id.type === "ObjectPattern") for (const prop of node.id.properties) {
         const name = prop.key?.name ?? literal(prop.key);
         if (value === "process" && name === "getBuiltinModule") builtinNames.add(prop.value.name);
-        if (CLIENTS[value]?.has(name)) bind(prop.value.name, value + "#" + name);
+        if (name === "default" && CLIENTS[value]) bind(prop.value.name, value);
+        else if (CLIENTS[value]?.has(name)) bind(prop.value.name, value + "#" + name);
       }
     }
   } while (changed);
   const hits = [], seen = new Set();
+  const calledMembers = new Set(list.filter(n => ["CallExpression", "NewExpression"].includes(n.type))
+    .map(n => unwrap(n.callee)));
   const add = node => {
     if (seen.has(node.start)) return;
     seen.add(node.start);
@@ -139,7 +146,7 @@ export function findRawTlsClients(content, file = "source.js") {
       if (CLIENTS[base]?.has(property)) add(node);
     }
     if (node.type === "MemberExpression" && kind(node) === "Bun#connect") {
-      if (node.parent?.type !== "CallExpression") add(node);
+      if (!calledMembers.has(node)) add(node);
     }
     if (node.type === "VariableDeclarator" && node.id.type === "ObjectPattern" && kind(node.init) === "Bun"
       && node.id.properties.some(p => (p.key?.name ?? literal(p.key)) === "connect")) add(node);

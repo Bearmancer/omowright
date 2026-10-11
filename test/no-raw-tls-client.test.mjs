@@ -15,11 +15,46 @@ const ALLOWLIST = [];
 
 describe("raw TLS client guard (CVE-2026-48618)", () => {
 
+  it("detects calls independently of their module acquisition pins", () => {
+    for (const [sample, call] of [
+  [
+    "import { default as client } from \"node:https\"; client.request(options);",
+    "client.request(options)"
+  ],
+  [
+    "import * as client from \"node:tls\"; client.connect(options);",
+    "client.connect(options)"
+  ],
+  [
+    "const client = require(\"node:https\"); client.get(url);",
+    "client.get(url)"
+  ],
+  [
+    "const { connect: dial } = await import(`node:tls`); dial(options);",
+    "dial(options)"
+  ],
+  [
+    "import client from \"https\"; const request = client.request; request(options);",
+    "request(options)"
+  ],
+  [
+    "const { default: client } = await import(\"node:https\"); client.get(url);",
+    "client.get(url)"
+  ]
+]) {
+      assert.ok(findRawTlsClients(sample).some(hit => hit.text === call), sample);
+    }
+  });
+  it("does not interpret regex or literal text as calls", () => {
+    for (const sample of ['const s = "tls.connect(o)";', 'const s = `tls.connect(o)`;', 'const r = /tls.connect\\(o\\)/;'])
+      assert.deepEqual(findRawTlsClients(sample), []);
+  });
+
   it("catches reviewer H1 regex/templates and H2 acquisitions (security regression)", () => {
     for (const sample of [
   "const r = /\"/; tls.connect(o); const s = \"x\";",
   "const r = /`/; tls.connect(o); const s = `x`;",
-  "const s = `${a ? `\"` : \"\"}`; tls.connect(o); const z = \"q\";",
+`const s = \`\${a ? \`"\` : ""}\`; tls.connect(o); const z = "q";`,
   "const r = /a\\/*/; tls.connect(o); /* */",
   "import { default as h } from \"node:https\"; h.request(o);",
   "export { default } from \"node:https\";",
@@ -80,6 +115,9 @@ describe("raw TLS client guard (CVE-2026-48618)", () => {
     }
     assert.deepEqual(findRawTlsClients('\n\ntls.connect({ host: "x)" });'), [
       { line: 3, text: 'tls.connect({ host: "x)" })' },
+    ]);
+    assert.deepEqual(findRawTlsClients("Bun.connect(options)"), [
+      { line: 1, text: "Bun.connect(options)" },
     ]);
   });
 
