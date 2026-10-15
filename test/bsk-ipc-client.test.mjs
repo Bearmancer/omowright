@@ -187,3 +187,51 @@ test("with auto-start enabled the client runs the starter once and retries disco
     assert.equal(starts, 1, "a discovered daemon is reused without restarting");
   } finally { await daemon.close(); rmSync(home, { recursive: true, force: true }); }
 });
+
+test("a live daemon whose daemon.json vanished is re-adopted through its socket, never restarted (omo#10216)", async () => {
+  const daemon = await startFakeBskDaemon();
+  let starts = 0;
+  try {
+    rmSync(path.join(daemon.home, "daemon.json"));
+    const client = new BskIpcClient({ home: daemon.home, autoStart: true, startDaemon: async () => { starts += 1; } });
+    assert.deepEqual(await client.call("system.ping", {}), { pong: true });
+    assert.equal(starts, 0, "starting a second daemon would fail on the held port");
+  } finally { await daemon.close(); }
+});
+
+test("with auto-start disabled a live daemon without daemon.json is still found through its socket", async () => {
+  const daemon = await startFakeBskDaemon();
+  try {
+    rmSync(path.join(daemon.home, "daemon.json"));
+    const client = new BskIpcClient({ home: daemon.home, autoStart: false });
+    assert.deepEqual(await client.call("system.ping", {}), { pong: true });
+  } finally { await daemon.close(); }
+});
+
+test("a tool call's own timeoutMs extends the IPC wait, so a long evaluate is not cut short (omo#10217)", async () => {
+  const daemon = await startFakeBskDaemon({ handlers: { "tool.evaluate": () => ({ result: { ok: true, value: 1 } }) }, delayMs: 300 });
+  try {
+    const client = new BskIpcClient({ home: daemon.home, autoStart: false, timeoutMs: 150 });
+    const result = await client.call("tool.evaluate", { session_id: "abcd", expression: "1", timeout_ms: 1000 });
+    assert.deepEqual(result, { ok: true, value: 1 });
+  } finally { await daemon.close(); }
+});
+
+test("an IPC timeout cancels the in-flight call so the session stays usable (omo#10217)", async () => {
+  let cancelled;
+  const gotCancel = new Promise((resolve) => { cancelled = resolve; });
+  const daemon = await startFakeBskDaemon({
+    handlers: {
+      "tool.evaluate": () => undefined,
+      cancel: (frame) => { cancelled(frame); return { result: { cancelled: true } }; },
+    },
+  });
+  try {
+    const client = new BskIpcClient({ home: daemon.home, autoStart: false, timeoutMs: 150 });
+    const handle = client.callWithHandle("tool.evaluate", { session_id: "abcd", expression: "new Promise(() => {})" }, { idPrefix: "evaluate" });
+    await assert.rejects(handle.promise, (err) => err instanceof BskRpcError && err.code === "timeout");
+    const frame = await Promise.race([gotCancel, new Promise((resolve) => setTimeout(() => resolve(null), 2000))]);
+    assert.ok(frame, "the timed-out call must be cancelled at the daemon");
+    assert.deepEqual(frame.params, { rpc_id: handle.rpcId });
+  } finally { await daemon.close(); }
+});
