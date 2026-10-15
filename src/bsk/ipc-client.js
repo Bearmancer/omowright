@@ -13,8 +13,17 @@ export { readDaemonInfo, resolveBskHome } from "./daemon-info.js";
 const DEFAULT_TIMEOUT_MS = 35_000; // daemon tool budget 30s + grace, as cli/mod.rs
 const DISCOVERY_RETRY_MS = 250;
 const DISCOVERY_BUDGET_MS = 15_000;
-// A tool call that names its own budget (timeout_ms) gets that budget plus this grace on the IPC wait.
+// A tool call that names its own budget (timeout_ms, or confirmation_timeout_ms for a tab borrow)
+// gets that budget plus this grace on the IPC wait.
 const TOOL_TIMEOUT_GRACE_MS = 5_000;
+// Tools that wait for a person: the daemon owns their deadline, so the client waits with no cap of its
+// own when the caller gave none, and never cancels them (that would tear down the user's overlay).
+const HUMAN_WAIT_METHODS = new Set(["tool.request_help", "tool.tab_borrow"]);
+
+function ownBudgetMs(params) {
+  const budget = params?.timeout_ms ?? params?.confirmation_timeout_ms;
+  return typeof budget === "number" ? budget + TOOL_TIMEOUT_GRACE_MS : undefined;
+}
 const PROBE_TIMEOUT_MS = 2_000;
 
 // Where the daemon listens when it was started with the default layout
@@ -94,8 +103,12 @@ export class BskIpcClient {
   // {rpcId, promise, abort()} — rpcId is known before the frame is sent so a
   // caller can cancel a long tool call from another connection.
   callWithHandle(method, params, { idPrefix = method.replace(/[^a-z0-9]+/gi, "-"), timeoutMs } = {}) {
-    const ownBudget = typeof params?.timeout_ms === "number" ? params.timeout_ms + TOOL_TIMEOUT_GRACE_MS : 0;
-    const waitMs = timeoutMs ?? Math.max(this.#timeoutMs, ownBudget);
+    const ownBudget = ownBudgetMs(params);
+    const humanWait = HUMAN_WAIT_METHODS.has(method);
+    // An explicit timeoutMs is a floor, never a cut below the tool's own budget.
+    const waitMs = humanWait && ownBudget === undefined
+      ? undefined
+      : Math.max(timeoutMs ?? this.#timeoutMs, ownBudget ?? 0);
     const rpcId = `${idPrefix}-${shortId()}`;
     const frame = { id: rpcId, method };
     if (params !== undefined) frame.params = params;
@@ -115,10 +128,11 @@ export class BskIpcClient {
           socket.destroy();
           fn(value);
         };
-        const timer = setTimeout(() => {
-          finish(reject, new BskRpcError("timeout", `${method} did not answer within ${waitMs}ms; the call was cancelled at the daemon`));
+        const timer = waitMs === undefined ? undefined : setTimeout(() => {
+          const cancels = method !== "cancel" && !humanWait;
+          finish(reject, new BskRpcError("timeout", `${method} did not answer within ${waitMs}ms${cancels ? "; a cancel was requested at the daemon" : ""}`));
           // The daemon would otherwise keep running it and hold the session for the next call.
-          if (method !== "cancel") this.cancel(rpcId).catch(() => {});
+          if (cancels) this.cancel(rpcId).catch(() => {});
         }, waitMs);
         abortSocket = () => finish(reject, new BskRpcError("cancelled", `${method} cancelled by caller`));
         socket.on("error", (error) => finish(reject, new BskRpcError("no_daemon", `IPC socket ${sockPath}: ${error.code ?? error.message}`)));
