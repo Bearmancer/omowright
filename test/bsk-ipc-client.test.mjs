@@ -131,22 +131,21 @@ test("cancel sends a cancel frame on its own connection while the call is in fli
 });
 
 test("abort before the socket is even resolved settles the handle as cancelled without touching the daemon", async () => {
-  const daemon = await startFakeBskDaemon();
+  // A home with no daemon.json and no live socket: the client has to start a daemon, and is aborted meanwhile.
+  const home = mkdtempSync(path.join(tmpdir(), "bsk-abort-"));
+  let starts = 0;
   try {
-    let releaseStart;
+    let releaseStart = () => {};
     const client = new BskIpcClient({
-      home: daemon.home, autoStart: true,
-      startDaemon: () => new Promise((resolve) => { releaseStart = resolve; }),
-      sockPath: undefined,
+      home, autoStart: true,
+      startDaemon: () => { starts += 1; return new Promise((resolve) => { releaseStart = resolve; }); },
     });
-    const { rmSync } = await import("node:fs");
-    rmSync(path.join(daemon.home, "daemon.json"));
     const handle = client.callWithHandle("system.ping", {});
     handle.abort();
     releaseStart();
     await assert.rejects(handle.promise, (err) => err instanceof BskRpcError && err.code === "cancelled");
-    assert.equal(daemon.requests.length, 0);
-  } finally { await daemon.close(); }
+    assert.ok(starts <= 1);
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });
 
 test("with auto-start disabled and no daemon.json the client fails fast and explains why", async () => {

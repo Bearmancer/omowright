@@ -67,6 +67,7 @@ export class BskIpcClient {
     if (found) return found.sock_path;
     // daemon.json can vanish while the daemon keeps running; starting another one then fails on the held port.
     const orphan = defaultSocketPath(this.#home);
+    if (isAborted()) throw new BskRpcError("cancelled", "cancelled before the daemon was located");
     if (await probeSocket(orphan)) return orphan;
     if (!this.#autoStart) {
       throw new BskRpcError("no_daemon", `no BrowserSkill daemon published at ${this.#home}/daemon.json and automatic start is disabled (BSK_AUTO_START=0); run \`bsk daemon start\` in the environment that owns it`);
