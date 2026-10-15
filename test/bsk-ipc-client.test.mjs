@@ -250,7 +250,7 @@ for (const [tool, params] of [
   });
 }
 
-test("a tab borrow's confirmation_timeout_ms bounds the wait, and its timeout neither cancels nor claims a cancel", async () => {
+test("a tab borrow's confirmation_timeout_ms bounds the wait, and its timeout neither cancels nor claims a cancel", { timeout: 20_000 }, async () => {
   // confirmation_timeout_ms 0 gives a wait of exactly the 5 s grace; the daemon answers later.
   const daemon = await startFakeBskDaemon({ handlers: { "tool.tab_borrow": () => ({ result: { borrowed: true } }) }, delayMs: 7000 });
   try {
