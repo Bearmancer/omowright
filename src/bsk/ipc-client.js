@@ -16,13 +16,14 @@ const DISCOVERY_BUDGET_MS = 15_000;
 // A tool call that names its own budget (timeout_ms, or confirmation_timeout_ms for a tab borrow)
 // gets that budget plus this grace on the IPC wait.
 const TOOL_TIMEOUT_GRACE_MS = 5_000;
-// Tools that wait for a person: the daemon owns their deadline, so the client waits with no cap of its
-// own when the caller gave none, and never cancels them (that would tear down the user's overlay).
+// Tools that wait for a person: the daemon owns their deadline, so with no budget from the caller the
+// client only keeps a long backstop, and it never cancels them (that would tear down the user's overlay).
 const HUMAN_WAIT_METHODS = new Set(["tool.request_help", "tool.tab_borrow"]);
+const HUMAN_WAIT_BACKSTOP_MS = 3_600_000;
 
 function ownBudgetMs(params) {
-  const budget = params?.timeout_ms ?? params?.confirmation_timeout_ms;
-  return typeof budget === "number" ? budget + TOOL_TIMEOUT_GRACE_MS : undefined;
+  const budgets = [params?.timeout_ms, params?.confirmation_timeout_ms].filter((value) => typeof value === "number");
+  return budgets.length > 0 ? Math.max(...budgets) + TOOL_TIMEOUT_GRACE_MS : undefined;
 }
 const PROBE_TIMEOUT_MS = 2_000;
 
@@ -106,8 +107,8 @@ export class BskIpcClient {
     const ownBudget = ownBudgetMs(params);
     const humanWait = HUMAN_WAIT_METHODS.has(method);
     // An explicit timeoutMs is a floor, never a cut below the tool's own budget.
-    const waitMs = humanWait && ownBudget === undefined
-      ? undefined
+    const waitMs = humanWait && ownBudget === undefined && timeoutMs === undefined
+      ? HUMAN_WAIT_BACKSTOP_MS
       : Math.max(timeoutMs ?? this.#timeoutMs, ownBudget ?? 0);
     const rpcId = `${idPrefix}-${shortId()}`;
     const frame = { id: rpcId, method };
@@ -128,7 +129,7 @@ export class BskIpcClient {
           socket.destroy();
           fn(value);
         };
-        const timer = waitMs === undefined ? undefined : setTimeout(() => {
+        const timer = setTimeout(() => {
           const cancels = method !== "cancel" && !humanWait;
           finish(reject, new BskRpcError("timeout", `${method} did not answer within ${waitMs}ms${cancels ? "; a cancel was requested at the daemon" : ""}`));
           // The daemon would otherwise keep running it and hold the session for the next call.

@@ -250,12 +250,20 @@ for (const [tool, params] of [
   });
 }
 
-test("tab_borrow's confirmation_timeout_ms extends the IPC wait", async () => {
-  const daemon = await startFakeBskDaemon({ handlers: { "tool.tab_borrow": () => ({ result: { borrowed: true } }) }, delayMs: 300 });
+test("a tab borrow's confirmation_timeout_ms bounds the wait, and its timeout neither cancels nor claims a cancel", async () => {
+  // confirmation_timeout_ms 0 gives a wait of exactly the 5 s grace; the daemon answers later.
+  const daemon = await startFakeBskDaemon({ handlers: { "tool.tab_borrow": () => ({ result: { borrowed: true } }) }, delayMs: 7000 });
   try {
     const client = new BskIpcClient({ home: daemon.home, autoStart: false, timeoutMs: 150 });
-    const result = await client.call("tool.tab_borrow", { session_id: "abcd", tab_id: 7, confirmation_timeout_ms: 1000 });
-    assert.deepEqual(result, { borrowed: true });
+    const started = Date.now();
+    await assert.rejects(client.call("tool.tab_borrow", { session_id: "abcd", tab_id: 7, confirmation_timeout_ms: 0 }), (err) => {
+      assert.ok(err instanceof BskRpcError);
+      assert.equal(err.code, "timeout");
+      assert.doesNotMatch(err.message, /cancel/);
+      return true;
+    });
+    assert.ok(Date.now() - started >= 4500, "the borrow's own budget, not the 150 ms default, bounds the wait");
+    assert.equal(daemon.requests.filter((frame) => frame.method === "cancel").length, 0);
   } finally { await daemon.close(); }
 });
 
