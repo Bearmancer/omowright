@@ -19,6 +19,15 @@ test("an endpoint that answered with the page's cookies cannot leak them to anot
   assert.deepEqual(sentTo("https://example.com/"), ["shared"]);
 });
 
+test("an IP host matches only a cookie for that exact IP, never a domain suffix (RFC 6265 5.1.3)", () => {
+  const cookie = (domain) => ({ name: "c", value: "1", domain, path: "/", secure: false });
+  assert.equal(cookieAppliesToUrl(cookie(".0.0.1"), "http://127.0.0.1/"), false);
+  assert.equal(cookieAppliesToUrl(cookie(".168.1.10"), "http://192.168.1.10/"), false);
+  assert.equal(cookieAppliesToUrl(cookie(".1"), "http://[::1]/"), false);
+  assert.equal(cookieAppliesToUrl(cookie("127.0.0.1"), "http://127.0.0.1/"), true);
+  assert.equal(cookieAppliesToUrl(cookie(".127.0.0.1"), "http://127.0.0.1/"), true);
+});
+
 test("path and secure rules match the browser's", () => {
   const cookie = (extra) => ({ name: "c", value: "1", domain: "site.test", path: "/app", secure: false, ...extra });
   assert.equal(cookieAppliesToUrl(cookie(), "http://site.test/app"), true);
