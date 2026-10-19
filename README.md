@@ -104,6 +104,16 @@ sleep to tune.
   `--remote-debugging-pipe` and speaks CDP over inherited file descriptors. No
   `/json/*` endpoint and no listening TCP port exist for the driven browser.
   `connect(url)` attaches to an existing DevTools endpoint instead.
+- **Scoped endpoints.** An app can hand OmOWright a limited browser (say, one
+  thread's tabs) behind a token: `connect(url, { client: { authorizer } })`
+  sends `Authorization` from `authorizer.resolveAuthorization({ forceRefresh })`
+  and asks once more with `forceRefresh` after a 401. Keep the token out of the
+  URL. `OMOWRIGHT_PAGE_CDP_METHODS` lists every command the page API sends, so
+  such an endpoint can allow exactly those and refuse the rest. The list
+  includes `DOM.setFileInputFiles`, which puts a local file into a page's file
+  input; the page then reads it, so a thread endpoint should only hand it paths
+  the user chose. `createEvents()` needs a full endpoint (it sends
+  `Browser.setDownloadBehavior`).
 - **Agent signals.** `createEvents()` pushes `tabOpened`, `popupOpened`,
   `downloadStarted` / `downloadFinished` and friends, so agents stop polling.
   `createAgentTabs()` opens every tab in the background and never steals focus.

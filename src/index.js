@@ -1,4 +1,5 @@
 export { connect, BrowserConnection, TabRepository } from "./connection.js";
+export { OMOWRIGHT_PAGE_CDP_METHODS } from "./cdp-methods.js";
 export { connectPipe, PipeCdpClient } from "./pipe.js";
 export {
   buildCloakBrowserArgs,
