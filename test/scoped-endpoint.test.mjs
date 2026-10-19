@@ -1,9 +1,11 @@
 // Protocol contract: a scoped CDP endpoint that allows only OMOWRIGHT_PAGE_CDP_METHODS and requires a Bearer token
-// is enough for the page API. A new command in the page path, or a token sent outside the Authorization header,
+// is enough for the page API. This fake forwards Target.* to the real browser; scoping them per thread is the
+// endpoint's job (tested in the OmO desktop app). A new command in the page path, or a token sent outside the Authorization header,
 // fails here.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { createServer } from "node:http";
 import { mkdtempSync, rmSync, existsSync, globSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -145,8 +147,11 @@ test("the page API runs through an endpoint that allows only OMOWRIGHT_PAGE_CDP_
   } finally {
     await connection?.close().catch(() => {});
     await endpoint.close();
+    const exited = upstream.child.exitCode === null ? once(upstream.child, "exit") : Promise.resolve();
     upstream.child.kill();
+    await exited;
     site.close();
     rmSync(userDataDir, { recursive: true, force: true });
   }
 });
+
