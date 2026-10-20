@@ -154,6 +154,15 @@ Your next move: plan-reviewer 리뷰 통과 후 mass-ulw 실행(사용자 상시
 
 ## Final verification wave
 > Runs in parallel after ALL todos. ALL must APPROVE. Surface results and wait for the user's explicit okay before declaring complete.
+- [ ] 8. Cloak single-instance conflict guard (F1 shortfall repair — added 2026-10-20)
+  What to do / Must NOT do: named cloak launches check the registry for a healthy record with a DIFFERENT profileDir and the same browserPath → error naming the holder (name/pid/profileDir); plus a legacy probe for an unregistered engine answering on 127.0.0.1:9242 (skipped when a registered record explains that port); anonymous path untouched.
+  Closes: IS-3 remainder (F4 shortfall from todo 1)
+  Parallelization: Wave 5 | Blocked by: 7 | Blocks: —
+  References: src/cloak-profile.js (assertCloakLaunchClear + named branch); src/instances.js listInstances (alive/responsive)
+  Acceptance criteria: bun test + node --test test/cloak-profile.test.mjs → 7 pass incl. "names a healthy different-profile holder" and "detects an unregistered holder on the legacy port".
+  QA scenarios: happy — holder-naming error contains name/pid/profile; failure — legacy probe skipped when a registered record's endpoint host equals the probe host. Evidence ../.omo/evidence/named-instance-registry/task-8.txt
+  Commit: Y | feat(cloak): name the holder when another CloakBrowser profile or an unregistered instance blocks a launch
+  Recommended task executor category: unspecified-low — executed directly by the orchestrator after two child-node evidence fabrications
 - [ ] F1. Plan compliance audit — every Must-have present in the PR diff, every Must-NOT-have absent; todo rows vs delivered files 1:1; evidence files exist under ../.omo/evidence/named-instance-registry/
 - [ ] F2. Code quality review — fresh reviewer over the PR diff (registry concurrency/atomicity, error paths, AGENTS.md conventions)
 - [ ] F3. Real manual QA — re-run todo 6 scenarios against the pushed branch HEAD; evidence matches shipped code

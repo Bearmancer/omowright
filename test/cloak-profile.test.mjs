@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import {
   chmodSync,
   existsSync,
@@ -196,5 +197,97 @@ test("anonymous connectCloakProfile creates no registry artifacts", { timeout: 1
     assert.equal(existsSync(defaultRegistryRoot), false);
   } finally {
     rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+const fakeNamedBrowser = fileURLToPath(
+  new URL("./fixtures/fake-named-browser.mjs", import.meta.url),
+);
+
+async function startFakeNamedBrowser() {
+  const child = spawn(process.execPath, [fakeNamedBrowser], {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  const endpoint = await new Promise((resolve, reject) => {
+    let buffered = "";
+    child.stderr.on("data", (chunk) => {
+      buffered += chunk;
+      const match = /DevTools listening on (ws:\/\/\S+)/.exec(buffered);
+      if (match) {
+        resolve(match[1].replace(/^ws:/, "http:").replace(/\/devtools\/.*$/, ""));
+      }
+    });
+    child.once("exit", (code) => reject(new Error(`fake browser exited (${code})`)));
+  });
+  return { child, endpoint };
+}
+
+test("named cloak launch names a healthy different-profile holder", async () => {
+  const registryRoot = mkdtempSync(path.join(tmpdir(), "nir-registry-"));
+  const mineDir = mkdtempSync(path.join(tmpdir(), "nir-mine-"));
+  const otherDir = mkdtempSync(path.join(tmpdir(), "nir-other-"));
+  const fake = await startFakeNamedBrowser();
+  try {
+    writeFileSync(
+      path.join(registryRoot, "holder.json"),
+      JSON.stringify({
+        version: 1,
+        name: "holder",
+        pid: process.pid,
+        endpoint: fake.endpoint,
+        profileDir: otherDir,
+        browserPath: process.execPath,
+        startedAt: new Date().toISOString(),
+      }),
+    );
+    await assert.rejects(
+      omowright.connectCloakProfile({
+        name: "mine",
+        browserPath: process.execPath,
+        profileDir: mineDir,
+        fingerprintSeed: 12345,
+        registryRoot,
+        legacyProbeUrl: "http://127.0.0.1:1",
+      }),
+      (error) =>
+        error.message.includes('"holder"') &&
+        error.message.includes(`pid ${process.pid}`) &&
+        error.message.includes(otherDir),
+    );
+  } finally {
+    fake.child.kill("SIGKILL");
+    rmSync(registryRoot, { recursive: true, force: true });
+    rmSync(mineDir, { recursive: true, force: true });
+    rmSync(otherDir, { recursive: true, force: true });
+  }
+});
+
+test("named cloak launch detects an unregistered holder on the legacy port", async () => {
+  const registryRoot = mkdtempSync(path.join(tmpdir(), "nir-registry-"));
+  const mineDir = mkdtempSync(path.join(tmpdir(), "nir-mine-"));
+  const server = createServer((req, res) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const legacyProbeUrl = `http://127.0.0.1:${server.address().port}`;
+  try {
+    await assert.rejects(
+      omowright.connectCloakProfile({
+        name: "mine",
+        browserPath: process.execPath,
+        profileDir: mineDir,
+        fingerprintSeed: 12345,
+        registryRoot,
+        legacyProbeUrl,
+      }),
+      (error) =>
+        error.message.includes("unregistered CloakBrowser") &&
+        error.message.includes(legacyProbeUrl),
+    );
+  } finally {
+    server.close();
+    rmSync(registryRoot, { recursive: true, force: true });
+    rmSync(mineDir, { recursive: true, force: true });
   }
 });
