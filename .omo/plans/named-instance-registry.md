@@ -163,6 +163,15 @@ Your next move: plan-reviewer 리뷰 통과 후 mass-ulw 실행(사용자 상시
   QA scenarios: happy — holder-naming error contains name/pid/profile; failure — legacy probe skipped when a registered record's endpoint host equals the probe host. Evidence ../.omo/evidence/named-instance-registry/task-8.txt
   Commit: Y | feat(cloak): name the holder when another CloakBrowser profile or an unregistered instance blocks a launch
   Recommended task executor category: unspecified-low — executed directly by the orchestrator after two child-node evidence fabrications
+- [ ] 9. F2 review blocker fixes (added 2026-10-20)
+  What to do / Must NOT do: close the 5 blockers from the F2 adversarial review (st_01a15979): engine-wide lock around cloak named launches; nonce-verified lock reclamation; refused-endpoint pid-reuse recovery (stale → relaunch; hanging endpoint still errors); null-profileDir guard in the conflict scan; leak-safe lock writes. Docs updated to the new refused/hung semantics.
+  Closes: IS-1/IS-3 review findings
+  Parallelization: Wave 6 | Blocked by: 8 | Blocks: —
+  References: ../.omo/evidence/named-instance-registry/task-9.txt (fix map + F2 notes N6-N8 recorded)
+  Acceptance criteria: bun + node --test on instances+cloak suites → 14 pass / 0 fail each.
+  QA scenarios: happy — reused-pid relaunch with registry-hygiene assertion; failure — hanging endpoint still raises unresponsive holder. Evidence ../.omo/evidence/named-instance-registry/task-9.txt
+  Commit: Y | fix(instances): close registry races found in review (c4a2e5f)
+  Recommended task executor category: unspecified-low — orchestrator-executed
 - [ ] F1. Plan compliance audit — every Must-have present in the PR diff, every Must-NOT-have absent; todo rows vs delivered files 1:1; evidence files exist under ../.omo/evidence/named-instance-registry/
 - [ ] F2. Code quality review — fresh reviewer over the PR diff (registry concurrency/atomicity, error paths, AGENTS.md conventions)
 - [ ] F3. Real manual QA — re-run todo 6 scenarios against the pushed branch HEAD; evidence matches shipped code
