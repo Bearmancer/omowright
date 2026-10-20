@@ -8,6 +8,7 @@ import {
 import { globSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { connectNamed } from "./instances.js";
 import { connectPipe } from "./pipe.js";
 
 const MIN_FINGERPRINT_SEED = 10_000;
@@ -170,16 +171,27 @@ export async function connectCloakProfile({
   fingerprintSeed = process.env.CLOAK_FINGERPRINT_SEED,
   browserArgs = [],
   storageRoot,
+  name,
   ...options
 } = {}) {
   const profile = await resolveCloakProfile({ profileDir, fingerprintSeed });
-  return connectPipe({
+  const resolvedBrowserArgs = buildCloakBrowserArgs({
+    profileDir: profile.profileDir,
+    fingerprintSeed: profile.fingerprintSeed,
+    extraArgs: browserArgs,
+  });
+  if (name === undefined) {
+    return connectPipe({
+      browserPath,
+      browserArgs: resolvedBrowserArgs,
+      storageRoot: storageRoot ?? profile.profileDir,
+      ...options,
+    });
+  }
+  return connectNamed(name, {
     browserPath,
-    browserArgs: buildCloakBrowserArgs({
-      profileDir: profile.profileDir,
-      fingerprintSeed: profile.fingerprintSeed,
-      extraArgs: browserArgs,
-    }),
+    browserArgs: resolvedBrowserArgs,
+    profileDir: profile.profileDir,
     storageRoot: storageRoot ?? profile.profileDir,
     ...options,
   });
