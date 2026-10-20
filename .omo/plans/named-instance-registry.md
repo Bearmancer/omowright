@@ -107,7 +107,7 @@ Your next move: plan-reviewer 리뷰 통과 후 mass-ulw 실행(사용자 상시
   Commit: Y | feat(connection): newTab on BrowserConnection for attach and launch paths
   Recommended task executor category: unspecified-low — small behavioral change, two files plus test fallout
 - [ ] 3. Adoption wiring: exports, connectCloakProfile name, CLI --name
-  What to do / Must NOT do: export connectNamed/listInstances from src/index.js (match export-list style); add optional name to connectCloakProfile (src/cloak-profile.js:167-185 — named → delegate to connectNamed with resolved cloak args; unnamed → byte-identical today path) and --name to bin/omowright-cloak.mjs parseArgs (value-flag list :38-50, help text, pass-through). Add regression assertion: anonymous connectCloakProfile creates NO registry artifacts. Must NOT alter cloak identity-flag rejection logic.
+  What to do / Must NOT do: export connectNamed/listInstances from src/index.js (match export-list style); add optional name to connectCloakProfile (src/cloak-profile.js:167-185 — named → delegate to connectNamed with resolved cloak args; unnamed → today's exact path, no registry writes) and --name to bin/omowright-cloak.mjs parseArgs (value-flag list :38-50, help text, pass-through). Add regression assertion: anonymous connectCloakProfile creates NO registry artifacts. Must NOT alter cloak identity-flag rejection logic.
   Closes: GAP-1 (API surface), GAP-3 (IS-5)
   Parallelization: Wave 2 | Blocked by: 1,2 | Blocks: 4,5
   References: src/index.js:1-74 (export style); src/cloak-profile.js:97-143,167-185; bin/omowright-cloak.mjs:28-52,68-107 (parseArgs, shutdown, browser.newTab usage); test/cloak-profile.test.mjs (conventions)
