@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { watch } from "node:fs";
 import {
   chmod,
@@ -124,12 +124,15 @@ function isPidAlive(pid) {
   }
 }
 
-async function readLockPid(lockPath) {
+async function readLockIdentity(lockPath) {
   try {
     const value = JSON.parse(await readFile(lockPath, "utf8"));
-    return Number.isInteger(value?.pid) && value.pid > 0 ? value.pid : null;
-  } catch (error) {
-    if (error?.code === "ENOENT") return null;
+    if (!Number.isInteger(value?.pid) || value.pid <= 0) return null;
+    return {
+      pid: value.pid,
+      nonce: typeof value.nonce === "string" ? value.nonce : null,
+    };
+  } catch {
     return null;
   }
 }
@@ -179,17 +182,30 @@ async function waitForLockRelease(lockPath, timeoutMs, holderPid) {
 
 async function acquireLock(lockPath, timeoutMs) {
   for (;;) {
+    const nonce = randomUUID();
     try {
       const handle = await open(lockPath, "wx", 0o600);
       try {
         await handle.writeFile(
-          `${JSON.stringify({ pid: process.pid })}\n`,
+          `${JSON.stringify({ pid: process.pid, nonce })}\n`,
           "utf8",
         );
-      } finally {
         await handle.close();
+        await chmod(lockPath, 0o600);
+      } catch (error) {
+        await handle.close().catch(() => {});
+        await unlink(lockPath).catch(() => {});
+        throw error;
       }
-      await chmod(lockPath, 0o600);
+      // Post-acquire verification: if a reclaimer removed a stale lock under
+      // us and another owner already created a fresh one, the file at this
+      // path is no longer ours — abandon it and retry instead of proceeding
+      // (which would allow two concurrent holders).
+      const readback = await readLockIdentity(lockPath);
+      if (readback?.nonce !== nonce) {
+        await waitForLockRelease(lockPath, timeoutMs, readback?.pid ?? process.pid);
+        continue;
+      }
       return async () => {
         await unlink(lockPath).catch((error) => {
           if (error?.code !== "ENOENT") throw error;
@@ -199,14 +215,21 @@ async function acquireLock(lockPath, timeoutMs) {
       if (error?.code !== "EEXIST") throw error;
     }
 
-    const holderPid = await readLockPid(lockPath);
-    if (holderPid === null || !isPidAlive(holderPid)) {
-      await unlink(lockPath).catch((error) => {
-        if (error?.code !== "ENOENT") throw error;
-      });
+    const holderIdentity = await readLockIdentity(lockPath);
+    if (holderIdentity === null || !isPidAlive(holderIdentity.pid)) {
+      // Narrow the reclaim race: only unlink when the file still shows the
+      // same dead holder. A fresh owner that slips in between is protected by
+      // its own post-acquire nonce verification above, so a stolen unlink can
+      // never produce two concurrent holders.
+      const recheck = await readLockIdentity(lockPath);
+      if (recheck?.pid === holderIdentity?.pid) {
+        await unlink(lockPath).catch((error) => {
+          if (error?.code !== "ENOENT") throw error;
+        });
+      }
       continue;
     }
-    await waitForLockRelease(lockPath, timeoutMs, holderPid);
+    await waitForLockRelease(lockPath, timeoutMs, holderIdentity.pid);
   }
 }
 
@@ -223,6 +246,20 @@ async function acquireLocalLock(key) {
     releaseCurrent();
     if (localLocks.get(key) === tail) localLocks.delete(key);
   };
+}
+
+function isConnectionRefused(error) {
+  for (let cause = error; cause; cause = cause?.cause) {
+    if (
+      cause.code === "ECONNREFUSED" ||
+      cause.code === "ENOTFOUND" ||
+      // Bun's fetch reports refused connections with this code.
+      cause.code === "ConnectionRefused"
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 async function probeEndpoint(endpoint, timeoutMs) {
@@ -463,6 +500,27 @@ async function launchNamed(
   }
 }
 
+export async function withEngineLock(registryRoot, engineKey, run) {
+  const root = path.resolve(registryRoot ?? DEFAULT_REGISTRY_ROOT);
+  await ensureRegistryRoot(root);
+  const digest = createHash("sha256")
+    .update(path.resolve(engineKey))
+    .digest("hex")
+    .slice(0, 16);
+  const lockPath = path.join(root, `_engine-${digest}.lock`);
+  const releaseLocal = await acquireLocalLock(lockPath);
+  try {
+    const release = await acquireLock(lockPath, DEFAULT_LOCK_TIMEOUT_MS);
+    try {
+      return await run();
+    } finally {
+      await release();
+    }
+  } finally {
+    releaseLocal();
+  }
+}
+
 export async function connectNamed(name, options = {}) {
   const normalizedName = normalizeName(name);
   const paths = registryPaths(options.registryRoot, normalizedName);
@@ -479,21 +537,30 @@ export async function connectNamed(name, options = {}) {
       if (loaded.record) {
         await chmod(paths.recordPath, 0o600);
         if (isPidAlive(loaded.record.pid)) {
+          let healthy = false;
           try {
             await probeEndpoint(
               loaded.record.endpoint,
               options.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS,
             );
+            healthy = true;
           } catch (error) {
-            throw new Error(
-              `unresponsive holder "${normalizedName}" pid ${loaded.record.pid} endpoint ${loaded.record.endpoint}: ${error.message}`,
-              { cause: error },
+            if (!isConnectionRefused(error)) {
+              throw new Error(
+                `unresponsive holder "${normalizedName}" pid ${loaded.record.pid} endpoint ${loaded.record.endpoint}: ${error.message}`,
+                { cause: error },
+              );
+            }
+            // A live pid whose recorded debug port refuses connections is a
+            // reused pid, not a holder: the record is stale and the launch
+            // below reclaims it.
+          }
+          if (healthy) {
+            return await connect(
+              loaded.record.endpoint,
+              connectionOptions(options, loaded.record.profileDir),
             );
           }
-          return await connect(
-            loaded.record.endpoint,
-            connectionOptions(options, loaded.record.profileDir),
-          );
         }
       }
 

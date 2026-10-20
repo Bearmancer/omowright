@@ -9,6 +9,7 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
   rm,
   stat,
   writeFile,
@@ -212,28 +213,72 @@ test("connectNamed replaces a dead-pid record with one launched browser", async 
   }
 });
 
-test("connectNamed rejects an alive holder with a dead endpoint", async () => {
+test("connectNamed relaunches when a reused pid leaves a refused endpoint", async () => {
   const registryRoot = await mkdtemp(
     path.join(tmpdir(), "omowright-instances-"),
   );
   const endpoint = await closedEndpoint();
+  let connection;
   try {
     await writeRecord(
       registryRoot,
-      "blocked",
-      instanceRecord("blocked", { pid: process.pid, endpoint }),
+      "reused",
+      instanceRecord("reused", { pid: process.pid, endpoint }),
+    );
+
+    connection = await connectNamed("reused", {
+      registryRoot,
+      browserPath: process.execPath,
+      browserArgs: [fixture],
+      probeTimeoutMs: 250,
+    });
+
+    // The live pid (this process) was NOT the holder: a fresh browser was
+    // launched and the record rewritten to its pid.
+    assert.notEqual(connection.browserProcess.pid, process.pid);
+    const rewritten = JSON.parse(
+      await readFile(path.join(registryRoot, "reused.json"), "utf8"),
+    );
+    assert.equal(rewritten.pid, connection.browserProcess.pid);
+    // Registry hygiene: no lock or temp artifacts survive a completed flow.
+    const leftovers = (await readdir(registryRoot)).filter(
+      (name) => name.endsWith(".lock") || name.endsWith(".tmp"),
+    );
+    assert.deepEqual(leftovers, []);
+  } finally {
+    await connection?.close().catch(() => {});
+    await rm(registryRoot, { recursive: true, force: true });
+  }
+});
+
+test("connectNamed rejects an alive holder whose endpoint hangs", async () => {
+  const registryRoot = await mkdtemp(
+    path.join(tmpdir(), "omowright-instances-"),
+  );
+  const server = createServer(() => {});
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const endpoint = `http://127.0.0.1:${server.address().port}`;
+  try {
+    await writeRecord(
+      registryRoot,
+      "hung",
+      instanceRecord("hung", { pid: process.pid, endpoint }),
     );
 
     await assert.rejects(
-      connectNamed("blocked", { registryRoot, probeTimeoutMs: 250 }),
+      connectNamed("hung", { registryRoot, probeTimeoutMs: 250 }),
       (error) => {
         assert.match(error.message, /unresponsive holder/);
         assert.match(error.message, new RegExp(`pid ${process.pid}`));
-        assert.match(error.message, new RegExp(endpoint.replaceAll(".", "\\.")));
+        assert.match(
+          error.message,
+          new RegExp(endpoint.replaceAll(".", "\\.")),
+        );
         return true;
       },
     );
   } finally {
+    server.close();
     await rm(registryRoot, { recursive: true, force: true });
   }
 });

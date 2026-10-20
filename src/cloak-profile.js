@@ -8,7 +8,7 @@ import {
 import { globSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { connectNamed, listInstances } from "./instances.js";
+import { connectNamed, listInstances, withEngineLock } from "./instances.js";
 import { connectPipe } from "./pipe.js";
 
 const LEGACY_CLOAK_PROBE_URL = "http://127.0.0.1:9242";
@@ -178,6 +178,7 @@ async function assertCloakLaunchClear({
   const records = await listInstances({ registryRoot, probeTimeoutMs });
   for (const record of records) {
     if (!record.alive || !record.responsive) continue;
+    if (!record.profileDir) continue;
     if (path.resolve(record.profileDir) === path.resolve(profileDir)) continue;
     if (record.browserPath !== browserPath) continue;
     throw new Error(
@@ -235,18 +236,20 @@ export async function connectCloakProfile({
     });
   }
   const { legacyProbeUrl, ...connectOptions } = options;
-  await assertCloakLaunchClear({
-    browserPath,
-    profileDir: profile.profileDir,
-    registryRoot: connectOptions.registryRoot,
-    legacyProbeUrl,
-    probeTimeoutMs: connectOptions.probeTimeoutMs,
-  });
-  return connectNamed(name, {
-    browserPath,
-    browserArgs: resolvedBrowserArgs,
-    profileDir: profile.profileDir,
-    storageRoot: storageRoot ?? profile.profileDir,
-    ...connectOptions,
+  return withEngineLock(connectOptions.registryRoot, browserPath, async () => {
+    await assertCloakLaunchClear({
+      browserPath,
+      profileDir: profile.profileDir,
+      registryRoot: connectOptions.registryRoot,
+      legacyProbeUrl,
+      probeTimeoutMs: connectOptions.probeTimeoutMs,
+    });
+    return connectNamed(name, {
+      browserPath,
+      browserArgs: resolvedBrowserArgs,
+      profileDir: profile.profileDir,
+      storageRoot: storageRoot ?? profile.profileDir,
+      ...connectOptions,
+    });
   });
 }

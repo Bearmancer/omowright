@@ -240,6 +240,20 @@ test("named cloak launch names a healthy different-profile holder", async () => 
         startedAt: new Date().toISOString(),
       }),
     );
+    // A healthy generic named instance without a profileDir must be ignored
+    // by the conflict scan, not crash it (path.resolve(null)).
+    writeFileSync(
+      path.join(registryRoot, "generic.json"),
+      JSON.stringify({
+        version: 1,
+        name: "generic",
+        pid: process.pid,
+        endpoint: fake.endpoint,
+        profileDir: null,
+        browserPath: process.execPath,
+        startedAt: new Date().toISOString(),
+      }),
+    );
     await assert.rejects(
       omowright.connectCloakProfile({
         name: "mine",

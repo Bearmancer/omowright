@@ -23,11 +23,12 @@ OmOWright times out.
 
 Use `connectNamed(name, options)` — attach-or-launch under one name, no probe
 ritual. A healthy registered instance is attached over its endpoint; a stale
-record is cleaned up and the browser relaunched; a live pid that stops answering
-fails fast with an `unresponsive holder` error naming the holder (name, pid,
-endpoint). Named launches expose CDP on a local-only TCP endpoint
-(`--remote-debugging-address=127.0.0.1 --remote-debugging-port=0`), and the
-returned `BrowserConnection` supports `newTab()` on both the launch and the
+record is cleaned up and the browser relaunched; a live pid whose recorded port
+refuses connections is a reused pid (treated as stale), while an endpoint that
+hangs or answers wrongly fails fast with an `unresponsive holder` error naming
+the holder (name, pid, endpoint). Named launches expose CDP on a local-only TCP
+endpoint (`--remote-debugging-address=127.0.0.1 --remote-debugging-port=0`), and
+the returned `BrowserConnection` supports `newTab()` on both the launch and the
 attach path.
 
 ```js
