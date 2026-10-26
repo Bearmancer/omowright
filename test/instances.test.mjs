@@ -21,7 +21,7 @@ import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { connectNamed, listInstances } from "../src/instances.js";
-import { reclaimLock } from "../src/instance-lock.js";
+import { reclaimLock, withLock } from "../src/instance-lock.js";
 
 const fixture = fileURLToPath(
   new URL("./fixtures/fake-named-browser.mjs", import.meta.url),
@@ -563,6 +563,100 @@ test("reclaimLock leaves a live lock that reuses the dead lock's inode", async (
     assert.equal(await readFile(lockPath, "utf8"), live);
     assert.deepEqual(await readdir(registryRoot), ["reused-inode.lock"]);
   } finally {
+    await rm(registryRoot, { recursive: true, force: true });
+  }
+});
+
+// Contract owner: the takeover never deletes a live lock, even when a third
+// contender takes the name while the lock is moved aside. Test seam: the hooks
+// run at the two points between reclaimLock's checks and its filesystem steps,
+// because no timing can force another process into those gaps.
+function lockText(pid, token) {
+  return `${JSON.stringify({ pid, token, acquiredAt: new Date().toISOString() })}\n`;
+}
+
+async function writeLiveLock(lockPath, token) {
+  await rm(lockPath, { force: true });
+  await writeFile(lockPath, lockText(process.pid, token), { mode: 0o600 });
+}
+
+test("reclaimLock puts a live lock back after a third contender took the name", async () => {
+  const registryRoot = await mkdtemp(
+    path.join(tmpdir(), "omowright-instances-"),
+  );
+  const lockPath = path.join(registryRoot, "three-way.lock");
+  try {
+    await writeFile(lockPath, lockText(deadPid(), "dead-holder"), { mode: 0o600 });
+    const { ino } = await stat(lockPath);
+    let blocked = 0;
+
+    const reclaimed = await reclaimLock(lockPath, ino, "dead-holder", {
+      hooks: {
+        // The dead lock is replaced by a live one after the checks passed ...
+        beforeMove: () => writeLiveLock(lockPath, "live-holder"),
+        // ... and once that live lock is moved aside, a third contender locks the name.
+        afterMove: () =>
+          writeFile(lockPath, lockText(process.pid, "third"), { mode: 0o600 }),
+        onPutBackBlocked: async () => {
+          blocked += 1;
+          if (blocked === 1) await rm(lockPath);
+        },
+      },
+    });
+
+    assert.equal(reclaimed, false);
+    assert.equal(blocked, 1, "the put-back met the third contender's lock once");
+    assert.equal(JSON.parse(await readFile(lockPath, "utf8")).token, "live-holder");
+    assert.deepEqual(await readdir(registryRoot), ["three-way.lock"]);
+  } finally {
+    await rm(registryRoot, { recursive: true, force: true });
+  }
+});
+
+test("a holder that releases while its lock is moved aside leaves no lock behind", async () => {
+  const registryRoot = await mkdtemp(
+    path.join(tmpdir(), "omowright-instances-"),
+  );
+  const lockPath = path.join(registryRoot, "release-aside.lock");
+  const lockOptions = { timeoutMs: 5_000, staleGraceMs: 60_000 };
+  let finishHold;
+  let holding;
+  let held = false;
+  try {
+    await writeFile(lockPath, lockText(deadPid(), "dead-holder"), { mode: 0o600 });
+    const { ino } = await stat(lockPath);
+
+    const reclaimed = await reclaimLock(lockPath, ino, "dead-holder", {
+      hooks: {
+        beforeMove: async () => {
+          await rm(lockPath);
+          const entered = new Promise((resolve) => {
+            holding = withLock(lockPath, lockOptions, () => {
+              resolve();
+              return new Promise((done) => {
+                finishHold = done;
+              });
+            });
+          });
+          await entered;
+        },
+        afterMove: () =>
+          writeFile(lockPath, lockText(process.pid, "third"), { mode: 0o600 }),
+        onPutBackBlocked: async () => {
+          if (held) return;
+          held = true;
+          finishHold();
+          await holding;
+          await rm(lockPath);
+        },
+      },
+    });
+
+    assert.equal(reclaimed, false);
+    await assert.rejects(stat(lockPath), (error) => error?.code === "ENOENT");
+    assert.deepEqual(await readdir(registryRoot), []);
+  } finally {
+    finishHold?.();
     await rm(registryRoot, { recursive: true, force: true });
   }
 });

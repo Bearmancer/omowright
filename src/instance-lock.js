@@ -1,16 +1,19 @@
-import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { watch } from "node:fs";
-import { chmod, link, open, readFile, rename, stat, unlink } from "node:fs/promises";
+import { link, readdir, rename, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { promisify } from "node:util";
+import {
+  createLock,
+  isSameLock,
+  processStartTime,
+  readLockState,
+} from "./lock-file.js";
 
 const LOCK_POLL_INTERVAL_MS = 250;
 const LOCK_RETRY_JITTER_MS = 25;
-const execFileAsync = promisify(execFile);
+const LOCK_PUT_BACK_TIMEOUT_MS = 30_000;
 const localLocks = new Map();
-let ownStartTime;
 
 export function isPidAlive(pid) {
   try {
@@ -29,94 +32,6 @@ export async function unlinkIfPresent(target) {
   });
 }
 
-// When the process holding `pid` started, in a form that only has to compare
-// equal to itself on this machine; null when the platform cannot say. A dead
-// holder's pid can be reused, and pid plus start time is what stays unique.
-async function processStartTime(pid) {
-  if (process.platform === "win32") return null;
-  if (process.platform === "linux") {
-    try {
-      const text = await readFile(`/proc/${pid}/stat`, "utf8");
-      // Field 22 (starttime); the fields after the parenthesised comm start at 3.
-      return text.slice(text.lastIndexOf(")") + 2).split(" ")[19] ?? null;
-    } catch {
-      return null;
-    }
-  }
-  try {
-    const { stdout } = await execFileAsync("ps", ["-o", "lstart=", "-p", String(pid)], {
-      env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
-    });
-    return stdout.trim() || null;
-  } catch {
-    return null;
-  }
-}
-
-// Build the lock out of sight and hard-link it into place, so a lock file is
-// never visible half-written: a reader either misses it or reads it whole.
-// Returns the inode and token that identify our lock, or null when the path is taken.
-async function createLock(lockPath) {
-  ownStartTime ??= processStartTime(process.pid);
-  const token = randomUUID();
-  const tempPath = `${lockPath}.${process.pid}.${randomUUID()}.tmp`;
-  let handle;
-  try {
-    handle = await open(tempPath, "wx", 0o600);
-    await handle.writeFile(
-      `${JSON.stringify({ pid: process.pid, start: await ownStartTime, token, acquiredAt: new Date().toISOString() })}\n`,
-      "utf8",
-    );
-    const { ino } = await handle.stat();
-    await handle.close();
-    handle = null;
-    await chmod(tempPath, 0o600);
-    try {
-      await link(tempPath, lockPath);
-    } catch (error) {
-      if (error?.code === "EEXIST") return null;
-      throw error;
-    }
-    return { ino, token };
-  } finally {
-    await handle?.close().catch(() => {});
-    await unlink(tempPath).catch(() => {});
-  }
-}
-
-// Content and inode come from one open handle, so the identity we act on is
-// bound to the exact file we inspected rather than to the path.
-async function readLockState(lockPath) {
-  let handle;
-  try {
-    handle = await open(lockPath, "r");
-  } catch (error) {
-    if (error?.code === "ENOENT") return null;
-    throw error;
-  }
-  try {
-    const stats = await handle.stat();
-    const text = await handle.readFile("utf8");
-    const state = { ino: stats.ino, mtimeMs: stats.mtimeMs, pid: null, start: null, token: null };
-    try {
-      const value = JSON.parse(text);
-      if (Number.isInteger(value?.pid) && value.pid > 0) state.pid = value.pid;
-      if (typeof value?.start === "string") state.start = value.start;
-      if (typeof value?.token === "string") state.token = value.token;
-    } catch {
-      // No identity: an empty or partial lock is aged out, never reclaimed on
-      // the spot, because a live contender may have just created it.
-    }
-    return state;
-  } finally {
-    await handle.close().catch(() => {});
-  }
-}
-
-function isSameLock(state, ino, token) {
-  return state !== null && state.ino === ino && state.token === token;
-}
-
 async function isAbandoned(state, staleGraceMs) {
   if (state.pid === null) return Date.now() - state.mtimeMs >= staleGraceMs;
   if (!isPidAlive(state.pid)) return true;
@@ -130,32 +45,66 @@ async function isAbandoned(state, staleGraceMs) {
 // reclaimers only one moves a given entry, and whatever we moved is ours alone
 // to inspect. An inode number alone is not enough because ext4 reuses them, so
 // a live lock created after the dead one vanished can carry the same inode;
-// its token differs, and anything that does not match goes straight back.
-export async function reclaimLock(lockPath, ino, token) {
+// its token differs, and anything that does not match is put back.
+// `hooks` lets a test run code inside the gaps between these steps.
+export async function reclaimLock(lockPath, ino, token, { deadline = Date.now() + LOCK_PUT_BACK_TIMEOUT_MS, hooks = {} } = {}) {
   if (!isSameLock(await readLockState(lockPath), ino, token)) {
     return (await stat(lockPath).catch(() => null)) === null;
   }
   const movedPath = `${lockPath}.${process.pid}.${randomUUID()}.stale`;
+  await hooks.beforeMove?.();
   try {
     await rename(lockPath, movedPath);
   } catch (error) {
     if (error?.code === "ENOENT") return true;
     throw error;
   }
-  try {
-    if (isSameLock(await readLockState(movedPath).catch(() => null), ino, token)) return true;
-    await link(movedPath, lockPath).catch((error) => {
-      if (error?.code !== "EEXIST") throw error;
-    });
-    return false;
-  } finally {
+  await hooks.afterMove?.();
+  if (isSameLock(await readLockState(movedPath).catch(() => null), ino, token)) {
     await unlinkIfPresent(movedPath);
+    return true;
+  }
+  await putBack(movedPath, lockPath, deadline, hooks);
+  return false;
+}
+
+// The moved file is a live holder's lock. While the name was empty another
+// contender may have locked it; the moved lock then waits for that one to go.
+// It is never deleted here: it leaves only when it is back under its name, when
+// its holder released it (releaseLock removes moved copies of its own lock), or
+// it stays where it is past the deadline for that holder to release.
+async function putBack(movedPath, lockPath, deadline, hooks) {
+  for (;;) {
+    try {
+      await link(movedPath, lockPath);
+      await unlinkIfPresent(movedPath);
+      return;
+    } catch (error) {
+      if (error?.code === "ENOENT") return;
+      if (error?.code !== "EEXIST") throw error;
+    }
+    await hooks.onPutBackBlocked?.();
+    if ((await stat(movedPath).catch(() => null)) === null) return;
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return;
+    await waitForLockRelease(lockPath, Math.min(remainingMs, LOCK_POLL_INTERVAL_MS));
   }
 }
 
-// Only unlink the entry while it still names the lock we created: if ours was
-// reclaimed under us, the file at this path belongs to the next owner.
+// Unlink only entries that still name the lock we created: if ours was
+// reclaimed under us, the file at this path belongs to the next owner. A
+// reclaimer may be holding our lock moved aside, so those copies go first;
+// checked in this order, a copy put back meanwhile is found under the name.
 async function releaseLock(lockPath, ino, token) {
+  const prefix = `${path.basename(lockPath)}.`;
+  const entries = await readdir(path.dirname(lockPath)).catch(() => []);
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix) || !entry.endsWith(".stale")) continue;
+    const moved = path.join(path.dirname(lockPath), entry);
+    if (isSameLock(await readLockState(moved).catch(() => null), ino, token)) {
+      await unlinkIfPresent(moved);
+    }
+  }
   if (!isSameLock(await readLockState(lockPath), ino, token)) return;
   await unlinkIfPresent(lockPath);
 }
@@ -218,7 +167,7 @@ async function acquireLock(lockPath, timeoutMs, staleGraceMs) {
     if (state === null) continue;
     holderPid = state.pid ?? holderPid;
     if (await isAbandoned(state, staleGraceMs)) {
-      await reclaimLock(lockPath, state.ino, state.token);
+      await reclaimLock(lockPath, state.ino, state.token, { deadline });
       // Jitter keeps two reclaimers from retrying in lockstep forever.
       await sleep(Math.random() * LOCK_RETRY_JITTER_MS);
       continue;
