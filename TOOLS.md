@@ -68,6 +68,28 @@ running Chromium DevTools endpoint).
 Every tool below is exported from `src/index.js`, the same import as the core
 loop; the module files next to it are implementation detail.
 
+- `connectNamed(name, { browserPath, browserArgs, profileDir, registryRoot?,
+  probeTimeoutMs?, launchTimeoutMs?, connectTimeoutMs?, lockTimeoutMs? })`:
+  attach-or-launch a named Chromium. A healthy registered instance is attached;
+  a stale record is cleaned up and relaunched; a live pid whose recorded port
+  refuses connections, or answers as a different browser, is treated as a reused
+  pid (stale → relaunch), while an endpoint that hangs or answers wrongly throws
+  an `unresponsive holder` error naming the holder (name, pid, endpoint). The
+  record stores the browser's `webSocketDebuggerUrl` (it carries the browser
+  GUID) and an attach happens only while the endpoint still answers with it, so
+  a reused pid plus a rebound port cannot hand you a stranger's browser. Every
+  wait is bounded: discovery by `probeTimeoutMs`, the launch by
+  `launchTimeoutMs`, the CDP handshake by `connectTimeoutMs`, the registry lock
+  by `lockTimeoutMs` (default: the other three plus a margin).
+  **The named endpoint is unauthenticated.** CDP listens on 127.0.0.1 with a
+  kernel-chosen port: off the network, but any local process or user can drive
+  that browser. Name-less launches (`connectPipe`, `connectCloakProfile()`
+  without `name`) expose no port at all.
+  `newTab()` works on both paths; `close()` from the launcher terminates the
+  browser and removes its record, from an attached client it only detaches.
+  `listInstances()` returns every record (`{ name, pid, endpoint,
+  webSocketDebuggerUrl, profileDir, browserPath, startedAt }`) with `alive` /
+  `responsive` liveness.
 - `createNetworkSnoop(page, { match?, bodies=true, maxEntries=500, maxBodyBytes? })`:
   buffer finished network entries for one page. `match` is a predicate or
   `{ url: string|RegExp, method, mimeType, resourceType }`. Methods: `pop()`
