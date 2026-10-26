@@ -185,6 +185,8 @@ test("live connect() honours dialogPolicy over WebSocket", {
     connection = await connect(wsUrl.replace(/^ws:/, "http:").replace(/\/devtools\/.*$/, ""), {
       storageRoot: ud,
       dialogPolicy: { accept: false },
+      // An unset client field must not erase the top-level policy.
+      client: { dialogPolicy: undefined },
     });
     const page = (await createAgentTabs(connection).create("about:blank")).page;
 
