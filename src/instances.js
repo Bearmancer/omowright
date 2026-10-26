@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { watch } from "node:fs";
 import {
   chmod,
+  link,
   mkdir,
   open,
   readFile,
@@ -13,9 +14,10 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { setTimeout as sleep } from "node:timers/promises";
 import { connect } from "./connection.js";
 
-const RECORD_VERSION = 1;
+const RECORD_VERSION = 2;
 const DEFAULT_REGISTRY_ROOT = path.join(
   os.homedir(),
   ".local",
@@ -25,7 +27,19 @@ const DEFAULT_REGISTRY_ROOT = path.join(
 );
 const DEFAULT_PROBE_TIMEOUT_MS = 1_000;
 const DEFAULT_LAUNCH_TIMEOUT_MS = 10_000;
-const DEFAULT_LOCK_TIMEOUT_MS = 10_000;
+const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
+// Waiting for the lock has to outlast the slowest honest critical section
+// (probe + launch + CDP attach); a shorter budget makes a second caller give up
+// at the exact moment the first one is about to publish its record.
+const LOCK_TIMEOUT_MARGIN_MS = 5_000;
+// Same sum the per-call resolver below computes, for callers with no overrides.
+const DEFAULT_LOCK_TIMEOUT_MS = resolveLockTimeoutMs({});
+// A lock whose content never became readable counts as held until it is older
+// than any legitimate hold: an unreadable lock is far more likely to be a
+// contender caught mid-acquire than an abandoned file.
+const STALE_LOCK_GRACE_MS = DEFAULT_LOCK_TIMEOUT_MS;
+const LOCK_POLL_INTERVAL_MS = 250;
+const LOCK_RETRY_JITTER_MS = 25;
 const localLocks = new Map();
 
 function normalizeName(name) {
@@ -64,6 +78,8 @@ function isRecord(value, expectedName) {
     value.pid > 0 &&
     typeof value.endpoint === "string" &&
     value.endpoint.length > 0 &&
+    typeof value.webSocketDebuggerUrl === "string" &&
+    value.webSocketDebuggerUrl.length > 0 &&
     (typeof value.profileDir === "string" || value.profileDir === null) &&
     typeof value.browserPath === "string" &&
     value.browserPath.length > 0 &&
@@ -124,112 +140,188 @@ function isPidAlive(pid) {
   }
 }
 
-async function readLockIdentity(lockPath) {
+async function unlinkIfPresent(target) {
+  await unlink(target).catch((error) => {
+    if (error?.code !== "ENOENT") throw error;
+  });
+}
+
+// Build the lock out of sight and hard-link it into place, so a lock file is
+// never visible half-written: a reader either misses it or reads it whole.
+// Returns the inode that identifies our lock, or null when the path is taken.
+async function createLock(lockPath) {
+  const tempPath = `${lockPath}.${process.pid}.${randomUUID()}.tmp`;
+  let handle;
   try {
-    const value = JSON.parse(await readFile(lockPath, "utf8"));
-    if (!Number.isInteger(value?.pid) || value.pid <= 0) return null;
-    return {
-      pid: value.pid,
-      nonce: typeof value.nonce === "string" ? value.nonce : null,
-    };
-  } catch {
-    return null;
+    handle = await open(tempPath, "wx", 0o600);
+    await handle.writeFile(
+      `${JSON.stringify({ pid: process.pid, acquiredAt: new Date().toISOString() })}\n`,
+      "utf8",
+    );
+    const { ino } = await handle.stat();
+    await handle.close();
+    handle = null;
+    await chmod(tempPath, 0o600);
+    try {
+      await link(tempPath, lockPath);
+    } catch (error) {
+      if (error?.code === "EEXIST") return null;
+      throw error;
+    }
+    return ino;
+  } finally {
+    await handle?.close().catch(() => {});
+    await unlink(tempPath).catch(() => {});
   }
 }
 
-async function waitForLockRelease(lockPath, timeoutMs, holderPid) {
+// Content and inode come from one open handle, so the identity we act on is
+// bound to the exact file we inspected rather than to the path.
+async function readLockState(lockPath) {
+  let handle;
   try {
-    await stat(lockPath);
+    handle = await open(lockPath, "r");
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw error;
+  }
+  try {
+    const stats = await handle.stat();
+    const text = await handle.readFile("utf8");
+    let pid = null;
+    try {
+      const value = JSON.parse(text);
+      if (Number.isInteger(value?.pid) && value.pid > 0) pid = value.pid;
+    } catch {
+      // No identity: an empty or partial lock is aged out, never reclaimed on
+      // the spot, because a live contender may have just created it.
+    }
+    return { ino: stats.ino, mtimeMs: stats.mtimeMs, pid };
+  } finally {
+    await handle.close().catch(() => {});
+  }
+}
+
+// Remove a lock proven abandoned without ever removing one that is not. The
+// rename is the exclusive step: of two reclaimers only one moves a given
+// directory entry. Whatever we moved is then ours alone to inspect, so the
+// inode check is exact; a lock we had not proven dead goes straight back.
+async function reclaimLock(lockPath, ino) {
+  try {
+    if ((await stat(lockPath)).ino !== ino) return false;
+  } catch (error) {
+    if (error?.code === "ENOENT") return true;
+    throw error;
+  }
+
+  const movedPath = `${lockPath}.${process.pid}.${randomUUID()}.stale`;
+  try {
+    await rename(lockPath, movedPath);
+  } catch (error) {
+    if (error?.code === "ENOENT") return true;
+    throw error;
+  }
+  try {
+    // Only a verified inode match is dropped by the cleanup below; anything we
+    // cannot prove dead — a fresh lock, or a file we failed to stat — goes back
+    // under the name its owner expects.
+    const moved = await stat(movedPath).catch(() => null);
+    if (moved?.ino === ino) return true;
+    await link(movedPath, lockPath).catch((error) => {
+      if (error?.code !== "EEXIST") throw error;
+    });
+    return false;
+  } finally {
+    await unlinkIfPresent(movedPath);
+  }
+}
+
+// Only unlink the entry while it still names the lock we created: if ours was
+// reclaimed under us, the file at this path belongs to the next owner.
+async function releaseLock(lockPath, ino) {
+  try {
+    if ((await stat(lockPath)).ino !== ino) return;
   } catch (error) {
     if (error?.code === "ENOENT") return;
     throw error;
   }
+  await unlinkIfPresent(lockPath);
+}
 
-  await new Promise((resolve, reject) => {
+function waitForLockRelease(lockPath, timeoutMs) {
+  return new Promise((resolve, reject) => {
     let settled = false;
-    const finish = (error) => {
+    let watcher;
+    let timer;
+    const finish = (error, released) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timeout);
-      watcher.close();
+      clearTimeout(timer);
+      watcher?.close();
       if (error) reject(error);
-      else resolve();
+      else resolve(released);
     };
     const check = () => {
-      stat(lockPath).catch((error) => {
-        if (error?.code === "ENOENT") finish();
-        else finish(error);
-      });
-    };
-    const watcher = watch(path.dirname(lockPath), (event, filename) => {
-      if (
-        (event === "rename" || event === "change") &&
-        (!filename || filename.toString() === path.basename(lockPath))
-      ) {
-        check();
-      }
-    });
-    const timeout = setTimeout(() => {
-      finish(
-        new Error(
-          `timed out waiting for instance lock held by pid ${holderPid}`,
-        ),
+      stat(lockPath).then(
+        () => {},
+        (error) => {
+          if (error?.code === "ENOENT") finish(null, true);
+          else finish(error);
+        },
       );
-    }, timeoutMs);
+    };
+    try {
+      watcher = watch(path.dirname(lockPath), (event, filename) => {
+        if (
+          (event === "rename" || event === "change") &&
+          (!filename || filename.toString() === path.basename(lockPath))
+        ) {
+          check();
+        }
+      });
+    } catch (error) {
+      if (error?.code !== "ENOENT") {
+        finish(error);
+        return;
+      }
+    }
+    timer = setTimeout(() => finish(null, false), timeoutMs);
     check();
   });
 }
 
 async function acquireLock(lockPath, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let holderPid = null;
   for (;;) {
-    const nonce = randomUUID();
-    try {
-      const handle = await open(lockPath, "wx", 0o600);
-      try {
-        await handle.writeFile(
-          `${JSON.stringify({ pid: process.pid, nonce })}\n`,
-          "utf8",
-        );
-        await handle.close();
-        await chmod(lockPath, 0o600);
-      } catch (error) {
-        await handle.close().catch(() => {});
-        await unlink(lockPath).catch(() => {});
-        throw error;
-      }
-      // Post-acquire verification: if a reclaimer removed a stale lock under
-      // us and another owner already created a fresh one, the file at this
-      // path is no longer ours — abandon it and retry instead of proceeding
-      // (which would allow two concurrent holders).
-      const readback = await readLockIdentity(lockPath);
-      if (readback?.nonce !== nonce) {
-        await waitForLockRelease(lockPath, timeoutMs, readback?.pid ?? process.pid);
-        continue;
-      }
-      return async () => {
-        await unlink(lockPath).catch((error) => {
-          if (error?.code !== "ENOENT") throw error;
-        });
-      };
-    } catch (error) {
-      if (error?.code !== "EEXIST") throw error;
+    const ino = await createLock(lockPath);
+    if (ino !== null) return () => releaseLock(lockPath, ino);
+    if (Date.now() >= deadline) {
+      throw new Error(
+        `timed out waiting for instance lock held by pid ${holderPid ?? "unknown"}`,
+      );
     }
 
-    const holderIdentity = await readLockIdentity(lockPath);
-    if (holderIdentity === null || !isPidAlive(holderIdentity.pid)) {
-      // Narrow the reclaim race: only unlink when the file still shows the
-      // same dead holder. A fresh owner that slips in between is protected by
-      // its own post-acquire nonce verification above, so a stolen unlink can
-      // never produce two concurrent holders.
-      const recheck = await readLockIdentity(lockPath);
-      if (recheck?.pid === holderIdentity?.pid) {
-        await unlink(lockPath).catch((error) => {
-          if (error?.code !== "ENOENT") throw error;
-        });
-      }
+    const state = await readLockState(lockPath);
+    if (state === null) continue;
+    holderPid = state.pid ?? holderPid;
+    const abandoned =
+      state.pid === null
+        ? Date.now() - state.mtimeMs >= STALE_LOCK_GRACE_MS
+        : !isPidAlive(state.pid);
+    if (abandoned) {
+      await reclaimLock(lockPath, state.ino);
+      // Jitter keeps two reclaimers from retrying in lockstep forever.
+      await sleep(Math.random() * LOCK_RETRY_JITTER_MS);
       continue;
     }
-    await waitForLockRelease(lockPath, timeoutMs, holderIdentity.pid);
+    const remainingMs = deadline - Date.now();
+    if (remainingMs > 0) {
+      await waitForLockRelease(
+        lockPath,
+        Math.min(remainingMs, LOCK_POLL_INTERVAL_MS),
+      );
+    }
   }
 }
 
@@ -280,6 +372,58 @@ async function probeEndpoint(endpoint, timeoutMs) {
     throw new Error("CDP discovery response lacks webSocketDebuggerUrl");
   }
   return version;
+}
+
+function resolveConnectTimeoutMs(options) {
+  return options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+}
+
+function resolveLockTimeoutMs(options) {
+  if (options.lockTimeoutMs !== undefined) return options.lockTimeoutMs;
+  return (
+    (options.launchTimeoutMs ?? DEFAULT_LAUNCH_TIMEOUT_MS) +
+    (options.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS) +
+    resolveConnectTimeoutMs(options) +
+    LOCK_TIMEOUT_MARGIN_MS
+  );
+}
+
+// `/json/version` answering proves nothing about the WebSocket upgrade behind
+// it, so the session handshake carries its own bound.
+async function connectWithin(endpoint, options, timeoutMs) {
+  const pending = connect(endpoint, options);
+  let timer;
+  try {
+    return await Promise.race([
+      pending,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(
+              new Error(
+                `timed out after ${timeoutMs}ms opening a CDP session on ${endpoint}`,
+              ),
+            ),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } catch (error) {
+    // A session that lands after the bound would otherwise hold a live socket.
+    pending.then(
+      (connection) => connection.close().catch(() => {}),
+      () => {},
+    );
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function removeOwnedRecord(recordPath, name, pid) {
+  const loaded = await readRecord(recordPath, name);
+  if (loaded.record?.pid !== pid) return;
+  await unlinkIfPresent(recordPath);
 }
 
 function profileDirFromArgs(browserArgs) {
@@ -462,19 +606,29 @@ async function launchNamed(
 
   let connection;
   try {
+    const launchTimeoutMs = options.launchTimeoutMs ?? DEFAULT_LAUNCH_TIMEOUT_MS;
     const endpoint = await discoverLaunchedEndpoint(child, {
       profileDir,
-      timeoutMs: options.launchTimeoutMs ?? DEFAULT_LAUNCH_TIMEOUT_MS,
+      timeoutMs: launchTimeoutMs,
     });
-    connection = await connect(
+    // The browser's own WebSocket URL carries its GUID: recording it makes a
+    // later attach prove it reached this browser and not whatever else ends up
+    // on the port once this pid is gone.
+    const { webSocketDebuggerUrl } = await probeEndpoint(
+      endpoint,
+      launchTimeoutMs,
+    );
+    connection = await connectWithin(
       endpoint,
       connectionOptions(options, profileDir),
+      resolveConnectTimeoutMs(options),
     );
     const record = {
       version: RECORD_VERSION,
       name,
       pid: child.pid,
       endpoint,
+      webSocketDebuggerUrl,
       profileDir,
       browserPath: path.resolve(options.browserPath),
       startedAt: new Date().toISOString(),
@@ -483,14 +637,21 @@ async function launchNamed(
     connection.browserProcess = child;
     const disconnect = connection.close.bind(connection);
     connection.close = async () => {
-      let disconnectError;
+      let failure;
       try {
         await disconnect();
       } catch (error) {
-        disconnectError = error;
+        failure = error;
       }
       await terminateBrowser(child);
-      if (disconnectError) throw disconnectError;
+      // The browser this record points at is gone, so the record goes with it
+      // instead of waiting for the next caller to clean it up.
+      try {
+        await removeOwnedRecord(recordPath, name, child.pid);
+      } catch (error) {
+        failure ??= error;
+      }
+      if (failure) throw failure;
     };
     return connection;
   } catch (error) {
@@ -530,20 +691,19 @@ export async function connectNamed(name, options = {}) {
   try {
     const release = await acquireLock(
       paths.lockPath,
-      options.lockTimeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS,
+      resolveLockTimeoutMs(options),
     );
     try {
       const loaded = await readRecord(paths.recordPath, normalizedName);
       if (loaded.record) {
         await chmod(paths.recordPath, 0o600);
         if (isPidAlive(loaded.record.pid)) {
-          let healthy = false;
+          let version = null;
           try {
-            await probeEndpoint(
+            version = await probeEndpoint(
               loaded.record.endpoint,
               options.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS,
             );
-            healthy = true;
           } catch (error) {
             if (!isConnectionRefused(error)) {
               throw new Error(
@@ -555,11 +715,25 @@ export async function connectNamed(name, options = {}) {
             // reused pid, not a holder: the record is stale and the launch
             // below reclaims it.
           }
-          if (healthy) {
-            return await connect(
-              loaded.record.endpoint,
-              connectionOptions(options, loaded.record.profileDir),
-            );
+          // A pid that came back and a port any local process can rebind are
+          // not an identity. Only the recorded WebSocket URL (it carries the
+          // browser GUID) says this is our browser; anything else answering
+          // there is a stranger, so the record is stale, not a holder.
+          if (
+            version?.webSocketDebuggerUrl === loaded.record.webSocketDebuggerUrl
+          ) {
+            try {
+              return await connectWithin(
+                loaded.record.endpoint,
+                connectionOptions(options, loaded.record.profileDir),
+                resolveConnectTimeoutMs(options),
+              );
+            } catch (error) {
+              throw new Error(
+                `unresponsive holder "${normalizedName}" pid ${loaded.record.pid} endpoint ${loaded.record.endpoint}: ${error.message}`,
+                { cause: error },
+              );
+            }
           }
         }
       }
@@ -598,7 +772,8 @@ export async function listInstances(options = {}) {
             loaded.record.endpoint,
             options.probeTimeoutMs ?? DEFAULT_PROBE_TIMEOUT_MS,
           ).then(
-            () => true,
+            (version) =>
+              version.webSocketDebuggerUrl === loaded.record.webSocketDebuggerUrl,
             () => false,
           );
         }

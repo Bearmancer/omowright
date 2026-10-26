@@ -12,6 +12,7 @@ import {
   readdir,
   rm,
   stat,
+  utimes,
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -24,13 +25,28 @@ import { connectNamed, listInstances } from "../src/instances.js";
 const fixture = fileURLToPath(
   new URL("./fixtures/fake-named-browser.mjs", import.meta.url),
 );
+const lockRaceChild = fileURLToPath(
+  new URL("./fixtures/named-instance-child.mjs", import.meta.url),
+);
+const fakeTarget = {
+  description: "",
+  id: "fake-page",
+  title: "Fake named browser",
+  type: "page",
+  url: "about:blank",
+};
 
 function instanceRecord(name, values) {
   return {
-    version: 1,
+    version: 2,
     name,
     pid: values.pid,
     endpoint: values.endpoint,
+    // The fixture derives its WebSocket URL from the port it listens on, so
+    // the default here is the one a healthy attach has to match.
+    webSocketDebuggerUrl:
+      values.webSocketDebuggerUrl ??
+      `${values.endpoint.replace(/^http/, "ws")}/devtools/browser/fake`,
     profileDir: values.profileDir ?? null,
     browserPath: values.browserPath ?? process.execPath,
     startedAt: values.startedAt ?? new Date().toISOString(),
@@ -58,17 +74,13 @@ async function launchFakeBrowser() {
   );
   child.stderr.setEncoding("utf8");
   let stderr = "";
-  const endpoint = await new Promise((resolve, reject) => {
+  const webSocketDebuggerUrl = await new Promise((resolve, reject) => {
     const onData = (chunk) => {
       stderr += chunk;
       const match = /DevTools listening on (ws:\/\/\S+)/.exec(stderr);
       if (!match) return;
       cleanup();
-      resolve(
-        match[1]
-          .replace(/^ws:/, "http:")
-          .replace(/\/devtools\/.*$/, ""),
-      );
+      resolve(match[1]);
     };
     const onError = (error) => {
       cleanup();
@@ -91,7 +103,13 @@ async function launchFakeBrowser() {
     child.once("error", onError);
     child.once("exit", onExit);
   });
-  return { child, endpoint };
+  return {
+    child,
+    webSocketDebuggerUrl,
+    endpoint: webSocketDebuggerUrl
+      .replace(/^ws:/, "http:")
+      .replace(/\/devtools\/.*$/, ""),
+  };
 }
 
 async function stopChild(child) {
@@ -146,15 +164,7 @@ test("connectNamed attaches to a healthy registered browser", async () => {
     connection = await connectNamed("healthy", { registryRoot });
 
     assert.equal(connection.browserProcess, undefined);
-    assert.deepEqual(await connection.listTargets(), [
-      {
-        description: "",
-        id: "fake-page",
-        title: "Fake named browser",
-        type: "page",
-        url: "about:blank",
-      },
-    ]);
+    assert.deepEqual(await connection.listTargets(), [fakeTarget]);
     await connection.close();
     connection = null;
     assert.doesNotThrow(() => process.kill(fake.child.pid, 0));
@@ -191,8 +201,9 @@ test("connectNamed replaces a dead-pid record with one launched browser", async 
 
     assert.equal(connection.browserProcess?.pid > 0, true);
     const rewritten = JSON.parse(await readFile(recordPath, "utf8"));
-    assert.equal(rewritten.version, 1);
+    assert.equal(rewritten.version, 2);
     assert.equal(rewritten.name, "stale");
+    assert.match(rewritten.webSocketDebuggerUrl, /^ws:\/\/127\.0\.0\.1:\d+\//);
     assert.equal(rewritten.pid, connection.browserProcess.pid);
     assert.notEqual(rewritten.pid, stalePid);
     assert.notEqual(rewritten.endpoint, "http://127.0.0.1:1");
@@ -206,6 +217,12 @@ test("connectNamed replaces a dead-pid record with one launched browser", async 
     assert.throws(
       () => process.kill(launchedPid, 0),
       (error) => error?.code === "ESRCH",
+    );
+    // The launcher took its record down with the browser instead of leaving a
+    // dead entry for listInstances to report.
+    await assert.rejects(
+      stat(recordPath),
+      (error) => error?.code === "ENOENT",
     );
   } finally {
     await connection?.close().catch(() => {});
@@ -298,7 +315,7 @@ test("connectNamed recovers from a malformed record", async () => {
     });
 
     const rewritten = JSON.parse(await readFile(recordPath, "utf8"));
-    assert.equal(rewritten.version, 1);
+    assert.equal(rewritten.version, 2);
     assert.equal(rewritten.name, "malformed");
     assert.equal(rewritten.pid, connection.browserProcess.pid);
   } finally {
@@ -307,6 +324,9 @@ test("connectNamed recovers from a malformed record", async () => {
   }
 });
 
+// Covers the in-process queue only: both calls share one `acquireLocalLock`
+// chain, so the file lock is barely reached. The cross-process test below owns
+// that contract.
 test("concurrent connectNamed calls launch exactly one browser", async () => {
   const registryRoot = await mkdtemp(
     path.join(tmpdir(), "omowright-instances-"),
@@ -346,6 +366,231 @@ test("concurrent connectNamed calls launch exactly one browser", async () => {
     await Promise.all(
       connections.map((connection) => connection.close().catch(() => {})),
     );
+    await rm(registryRoot, { recursive: true, force: true });
+  }
+});
+
+// Contract owner: the cross-process registry lock. Two separate processes race
+// on one name through a stdin barrier, so nothing in a single process's memory
+// can serialize them: a lock that two holders can enter launches two browsers
+// here and leaves one of them unregistered.
+test("two processes racing one name launch exactly one browser", { timeout: 30_000 }, async () => {
+  const registryRoot = await mkdtemp(
+    path.join(tmpdir(), "omowright-instances-"),
+  );
+  const children = [];
+  const results = [];
+  try {
+    const runs = [0, 1].map(
+      (index) =>
+        new Promise((resolve, reject) => {
+          const child = spawn(
+            process.execPath,
+            [lockRaceChild, registryRoot, "contended"],
+            { stdio: ["pipe", "pipe", "pipe"] },
+          );
+          children.push(child);
+          let stdout = "";
+          let stderr = "";
+          child.stdout.setEncoding("utf8");
+          child.stderr.setEncoding("utf8");
+          child.stdout.on("data", (chunk) => {
+            stdout += chunk;
+            if (!child.ready && stdout.includes("READY\n")) {
+              child.ready = true;
+              child.emit("barrier-ready");
+            }
+          });
+          child.stderr.on("data", (chunk) => {
+            stderr += chunk;
+          });
+          child.once("error", reject);
+          child.once("close", (code) => {
+            if (code !== 0) {
+              reject(new Error(`child ${index} exited ${code}:\n${stderr}`));
+              return;
+            }
+            const payload = stdout.trim().split("\n").at(-1);
+            try {
+              resolve(JSON.parse(payload));
+            } catch (error) {
+              reject(
+                new Error(`child ${index} printed ${payload}: ${error.message}`),
+              );
+            }
+          });
+        }),
+    );
+
+    await Promise.all(
+      children.map((child) =>
+        child.ready ? undefined : once(child, "barrier-ready"),
+      ),
+    );
+    for (const child of children) child.stdin.write("go\n");
+    results.push(...(await Promise.all(runs)));
+
+    const launched = results.filter((result) => result.launched);
+    assert.equal(launched.length, 1);
+    const record = JSON.parse(
+      await readFile(path.join(registryRoot, "contended.json"), "utf8"),
+    );
+    assert.equal(record.pid, launched[0].browserPid);
+    // The loser attached instead of launching: it drove a live browser and the
+    // one browser in the registry outlived both processes.
+    for (const result of results) assert.deepEqual(result.targets, [fakeTarget]);
+    assert.doesNotThrow(() => process.kill(record.pid, 0));
+    const leftovers = (await readdir(registryRoot)).filter(
+      (name) => !name.endsWith(".json"),
+    );
+    assert.deepEqual(leftovers, []);
+  } finally {
+    for (const result of results) {
+      if (!result.browserPid) continue;
+      try {
+        process.kill(result.browserPid, "SIGKILL");
+      } catch {
+        // Already gone.
+      }
+    }
+    for (const child of children) await stopChild(child);
+    await rm(registryRoot, { recursive: true, force: true });
+  }
+});
+
+// Contract owner: what counts as an abandoned lock. A lock with no readable
+// identity is a contender caught between creating and writing its file, so
+// reclaiming it on sight lets two callers hold the same name.
+test("connectNamed treats an identity-less lock as held until it ages out", async () => {
+  const registryRoot = await mkdtemp(
+    path.join(tmpdir(), "omowright-instances-"),
+  );
+  const lockPath = path.join(registryRoot, "halfwritten.lock");
+  const options = {
+    registryRoot,
+    browserPath: process.execPath,
+    browserArgs: [fixture],
+  };
+  let connection;
+  try {
+    await writeFile(lockPath, "", { mode: 0o600 });
+
+    await assert.rejects(
+      connectNamed("halfwritten", { ...options, lockTimeoutMs: 300 }),
+      /timed out waiting for instance lock/,
+    );
+    // The lock survived: nothing stole it and nothing was launched.
+    assert.equal((await stat(lockPath)).size, 0);
+    assert.deepEqual(await readdir(registryRoot), ["halfwritten.lock"]);
+
+    // Older than any legitimate hold, it is finally reclaimed.
+    const aged = new Date(Date.now() - 3_600_000);
+    await utimes(lockPath, aged, aged);
+    connection = await connectNamed("halfwritten", options);
+
+    assert.equal(connection.browserProcess?.pid > 0, true);
+    assert.deepEqual(
+      (await readdir(registryRoot)).filter((name) => !name.endsWith(".json")),
+      [],
+    );
+  } finally {
+    await connection?.close().catch(() => {});
+    await rm(registryRoot, { recursive: true, force: true });
+  }
+});
+
+// Contract owner: holder identity. A live pid and an answering loopback port
+// are both reusable by anything else on the machine; only the recorded
+// WebSocket URL (it carries the browser GUID) proves the holder is ours.
+test("connectNamed relaunches when a stranger answers on the recorded endpoint", async () => {
+  const registryRoot = await mkdtemp(
+    path.join(tmpdir(), "omowright-instances-"),
+  );
+  const stranger = await launchFakeBrowser();
+  let connection;
+  try {
+    await writeRecord(
+      registryRoot,
+      "foreign",
+      instanceRecord("foreign", {
+        pid: stranger.child.pid,
+        endpoint: stranger.endpoint,
+        webSocketDebuggerUrl: `${stranger.webSocketDebuggerUrl}-of-a-browser-that-exited`,
+      }),
+    );
+
+    connection = await connectNamed("foreign", {
+      registryRoot,
+      browserPath: process.execPath,
+      browserArgs: [fixture],
+    });
+
+    assert.equal(connection.browserProcess?.pid > 0, true);
+    assert.notEqual(connection.browserProcess.pid, stranger.child.pid);
+    const rewritten = JSON.parse(
+      await readFile(path.join(registryRoot, "foreign.json"), "utf8"),
+    );
+    assert.equal(rewritten.pid, connection.browserProcess.pid);
+    assert.notEqual(rewritten.endpoint, stranger.endpoint);
+  } finally {
+    await connection?.close().catch(() => {});
+    await stopChild(stranger.child);
+    await rm(registryRoot, { recursive: true, force: true });
+  }
+});
+
+// Contract owner: the attach handshake bound. Discovery answering says nothing
+// about the WebSocket upgrade behind it, and an unbounded attach hangs the
+// caller forever instead of naming the holder.
+test("connectNamed gives up when the holder's WebSocket upgrade hangs", async () => {
+  const registryRoot = await mkdtemp(
+    path.join(tmpdir(), "omowright-instances-"),
+  );
+  const held = new Set();
+  const server = createServer((request, response) => {
+    if (request.url !== "/json/version") {
+      response.writeHead(404).end();
+      return;
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(
+      JSON.stringify({
+        Browser: "StalledBrowser/1.0",
+        webSocketDebuggerUrl: `ws://127.0.0.1:${server.address().port}/devtools/browser/stalled`,
+      }),
+    );
+  });
+  // Accept the upgrade and answer never.
+  server.on("upgrade", (_request, socket) => held.add(socket));
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const endpoint = `http://127.0.0.1:${server.address().port}`;
+  try {
+    await writeRecord(
+      registryRoot,
+      "stalled",
+      instanceRecord("stalled", {
+        pid: process.pid,
+        endpoint,
+        webSocketDebuggerUrl: `ws://127.0.0.1:${server.address().port}/devtools/browser/stalled`,
+      }),
+    );
+
+    await assert.rejects(
+      connectNamed("stalled", {
+        registryRoot,
+        probeTimeoutMs: 1_000,
+        connectTimeoutMs: 300,
+      }),
+      (error) => {
+        assert.match(error.message, /unresponsive holder "stalled"/);
+        assert.match(error.message, /timed out after 300ms/);
+        assert.match(error.message, new RegExp(endpoint.replaceAll(".", "\\.")));
+        return true;
+      },
+    );
+  } finally {
+    for (const socket of held) socket.destroy();
+    server.close();
     await rm(registryRoot, { recursive: true, force: true });
   }
 });
@@ -395,6 +640,7 @@ test("listInstances reports versioned records with liveness metadata", async () 
         "responsive",
         "startedAt",
         "version",
+        "webSocketDebuggerUrl",
       ].sort(),
     );
     assert.equal(instances[0].alive, true);
