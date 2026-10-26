@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { watch } from "node:fs";
-import { link, readdir, rename, stat, unlink, utimes } from "node:fs/promises";
+import { link, readdir, rename, stat, unlink } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import {
@@ -13,7 +13,6 @@ import {
 const LOCK_POLL_INTERVAL_MS = 250;
 const LOCK_RETRY_JITTER_MS = 25;
 const LOCK_PUT_BACK_TIMEOUT_MS = 30_000;
-const RELEASE_SEARCH_ATTEMPTS = 5;
 const localLocks = new Map();
 
 export function isPidAlive(pid) {
@@ -33,16 +32,7 @@ export async function unlinkIfPresent(target) {
   });
 }
 
-// A holder marks its lock released by setting the file's mtime to 0, one
-// atomic metadata write on the inode. Every link to that inode carries the
-// mark, so a copy moved aside or put back after the release is still known
-// to be free. No live lock has mtime 0: createLock writes fresh files.
-function isReleased(state) {
-  return state.mtimeMs === 0;
-}
-
 async function isAbandoned(state, staleGraceMs) {
-  if (isReleased(state)) return true;
   if (state.pid === null) return Date.now() - state.mtimeMs >= staleGraceMs;
   if (!isPidAlive(state.pid)) return true;
   if (state.start === null) return false;
@@ -56,6 +46,11 @@ async function isAbandoned(state, staleGraceMs) {
 // to inspect. An inode number alone is not enough because ext4 reuses them, so
 // a live lock created after the dead one vanished can carry the same inode;
 // its token differs, and anything that does not match is put back.
+// Known residuals of a takeover built from path operations (#62 replaces it):
+// while a live lock is moved aside another contender can take the name, so two
+// processes hold it until the put-back; and a holder that releases while its
+// lock is moved aside can have that finished lock put back, which keeps the
+// name locked until the holder's process exits.
 // `hooks` lets a test run code inside the gaps between these steps.
 export async function reclaimLock(lockPath, ino, token, { deadline = Date.now() + LOCK_PUT_BACK_TIMEOUT_MS, hooks = {} } = {}) {
   if (!isSameLock(await readLockState(lockPath), ino, token)) {
@@ -80,93 +75,43 @@ export async function reclaimLock(lockPath, ino, token, { deadline = Date.now() 
 
 // The moved file is a live holder's lock. While the name was empty another
 // contender may have locked it; the moved lock then waits for that one to go.
-// It is never deleted while its holder may still hold it: it leaves only when
-// it is back under its name, when its holder released it (the release marks
-// the inode and removes moved copies it finds), or it stays where it is past
-// the deadline, for the holder's release or a later sweep to remove.
+// It is never deleted here: it leaves only when it is back under its name, when
+// its holder released it (releaseLock removes moved copies of its own lock), or
+// it stays where it is past the deadline for that holder to release.
 async function putBack(movedPath, lockPath, deadline, hooks) {
   for (;;) {
-    const moved = await readLockState(movedPath).catch(() => null);
-    if (moved === null) return;
-    if (isReleased(moved)) {
-      await unlinkIfPresent(movedPath);
-      return;
-    }
     try {
       await link(movedPath, lockPath);
+      await unlinkIfPresent(movedPath);
+      return;
     } catch (error) {
       if (error?.code === "ENOENT") return;
       if (error?.code !== "EEXIST") throw error;
-      await hooks.onPutBackBlocked?.();
-      const remainingMs = deadline - Date.now();
-      if (remainingMs <= 0) return;
-      await waitForLockRelease(lockPath, Math.min(remainingMs, LOCK_POLL_INTERVAL_MS));
-      continue;
     }
-    await unlinkIfPresent(movedPath);
-    // The holder may have marked it released between our read and the link;
-    // a released lock back under the name would block it until it is reclaimed.
-    const restored = await readLockState(lockPath);
-    if (isReleased(restored ?? {}) && isSameLock(restored, moved.ino, moved.token)) {
-      await unlinkIfPresent(lockPath);
-    }
-    return;
+    await hooks.onPutBackBlocked?.();
+    if ((await stat(movedPath).catch(() => null)) === null) return;
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return;
+    await waitForLockRelease(lockPath, Math.min(remainingMs, LOCK_POLL_INTERVAL_MS));
   }
 }
 
-function staleCopyPaths(lockPath, entries) {
+// Unlink only entries that still name the lock we created: if ours was
+// reclaimed under us, the file at this path belongs to the next owner. A
+// reclaimer may be holding our lock moved aside, so those copies go first;
+// checked in this order, a copy put back meanwhile is found under the name.
+async function releaseLock(lockPath, ino, token) {
   const prefix = `${path.basename(lockPath)}.`;
-  return entries
-    .filter((entry) => entry.startsWith(prefix) && entry.endsWith(".stale"))
-    .map((entry) => path.join(path.dirname(lockPath), entry));
-}
-
-// Where our lock is right now: under its name, or moved aside by a reclaimer.
-async function findOwnLock(lockPath, ino, token) {
-  if (isSameLock(await readLockState(lockPath), ino, token)) return lockPath;
   const entries = await readdir(path.dirname(lockPath)).catch(() => []);
-  for (const copy of staleCopyPaths(lockPath, entries)) {
-    if (isSameLock(await readLockState(copy).catch(() => null), ino, token)) return copy;
-  }
-  return null;
-}
-
-// Marks our lock released first, wherever it is, then removes every entry
-// that still names it. Once marked, a copy we miss because a reclaimer moves
-// or puts it back meanwhile is still free: putBack drops it and isAbandoned
-// reclaims it. A rename or link always leaves the inode under some entry, so
-// the search below only misses it while a reclaimer is mid-step.
-async function releaseLock(lockPath, ino, token, hooks = {}) {
-  for (let attempt = 0; attempt < RELEASE_SEARCH_ATTEMPTS; attempt += 1) {
-    const found = await findOwnLock(lockPath, ino, token);
-    if (found === null) continue;
-    try {
-      await utimes(found, 0, 0);
-      break;
-    } catch (error) {
-      if (error?.code !== "ENOENT") throw error;
+  for (const entry of entries) {
+    if (!entry.startsWith(prefix) || !entry.endsWith(".stale")) continue;
+    const moved = path.join(path.dirname(lockPath), entry);
+    if (isSameLock(await readLockState(moved).catch(() => null), ino, token)) {
+      await unlinkIfPresent(moved);
     }
   }
-  await hooks.afterMark?.();
-  if (isSameLock(await readLockState(lockPath), ino, token)) await unlinkIfPresent(lockPath);
-  await hooks.beforeScan?.();
-  const entries = await readdir(path.dirname(lockPath)).catch(() => []);
-  for (const copy of staleCopyPaths(lockPath, entries)) {
-    if (isSameLock(await readLockState(copy).catch(() => null), ino, token)) {
-      await unlinkIfPresent(copy);
-    }
-  }
-}
-
-// Moved copies whose holder is gone (released, dead, or an identity-less
-// file past the grace period) are removed. A copy whose holder may still hold
-// it stays for its put-back.
-async function sweepStaleCopies(lockPath, staleGraceMs) {
-  const entries = await readdir(path.dirname(lockPath)).catch(() => []);
-  for (const copy of staleCopyPaths(lockPath, entries)) {
-    const state = await readLockState(copy).catch(() => null);
-    if (state !== null && (await isAbandoned(state, staleGraceMs))) await unlinkIfPresent(copy);
-  }
+  if (!isSameLock(await readLockState(lockPath), ino, token)) return;
+  await unlinkIfPresent(lockPath);
 }
 
 function waitForLockRelease(lockPath, timeoutMs) {
@@ -211,29 +156,22 @@ function waitForLockRelease(lockPath, timeoutMs) {
   });
 }
 
-async function acquireLock(lockPath, timeoutMs, staleGraceMs, hooks) {
+async function acquireLock(lockPath, timeoutMs, staleGraceMs) {
   const deadline = Date.now() + timeoutMs;
   let holderPid = null;
-  let swept = false;
   for (;;) {
     const ours = await createLock(lockPath);
-    if (ours !== null) return () => releaseLock(lockPath, ours.ino, ours.token, hooks);
+    if (ours !== null) return () => releaseLock(lockPath, ours.ino, ours.token);
     if (Date.now() >= deadline) {
       throw new Error(
         `timed out waiting for instance lock held by pid ${holderPid ?? "unknown"}`,
       );
     }
 
-    if (!swept) {
-      swept = true;
-      await sweepStaleCopies(lockPath, staleGraceMs);
-    }
     const state = await readLockState(lockPath);
     if (state === null) continue;
     holderPid = state.pid ?? holderPid;
     if (await isAbandoned(state, staleGraceMs)) {
-      // The reclaim may wait, inside our own budget, for a live lock it moved
-      // aside to go back; a timeout then names the holder we last read.
       await reclaimLock(lockPath, state.ino, state.token, { deadline });
       // Jitter keeps two reclaimers from retrying in lockstep forever.
       await sleep(Math.random() * LOCK_RETRY_JITTER_MS);
@@ -263,11 +201,10 @@ async function acquireLocalLock(key) {
 
 // Runs `run` while this process and every other one agree we hold `lockPath`.
 // A lock with no readable identity counts as held until it is `staleGraceMs` old.
-// `hooks.afterMark` and `hooks.beforeScan` let a test run code inside the release.
-export async function withLock(lockPath, { timeoutMs, staleGraceMs, hooks }, run) {
+export async function withLock(lockPath, { timeoutMs, staleGraceMs }, run) {
   const releaseLocal = await acquireLocalLock(lockPath);
   try {
-    const release = await acquireLock(lockPath, timeoutMs, staleGraceMs, hooks);
+    const release = await acquireLock(lockPath, timeoutMs, staleGraceMs);
     try {
       return await run();
     } finally {
