@@ -24,12 +24,21 @@ OmOWright times out.
 Use `connectNamed(name, options)` — attach-or-launch under one name, no probe
 ritual. A healthy registered instance is attached over its endpoint; a stale
 record is cleaned up and the browser relaunched; a live pid whose recorded port
-refuses connections is a reused pid (treated as stale), while an endpoint that
-hangs or answers wrongly fails fast with an `unresponsive holder` error naming
-the holder (name, pid, endpoint). Named launches expose CDP on a local-only TCP
-endpoint (`--remote-debugging-address=127.0.0.1 --remote-debugging-port=0`), and
-the returned `BrowserConnection` supports `newTab()` on both the launch and the
+refuses connections, or answers as a different browser, is a reused pid (treated
+as stale), while an endpoint that hangs or answers wrongly fails fast with an
+`unresponsive holder` error naming the holder (name, pid, endpoint). The record
+stores the browser's `webSocketDebuggerUrl` (it carries the browser GUID), and
+an attach happens only when the endpoint still answers with that exact URL. The
+returned `BrowserConnection` supports `newTab()` on both the launch and the
 attach path.
+
+**A named instance is not private.** Naming one replaces the pipe transport with
+a TCP endpoint (`--remote-debugging-address=127.0.0.1 --remote-debugging-port=0`).
+Loopback keeps it off the network, but nothing authenticates it: any process or
+user on this machine can read the registry record (or scan the port) and drive
+the browser — cookies, logged-in sessions, local file reads through CDP.
+Name-less launches keep the pipe and expose no port at all, so use a name only
+on a machine you trust and only when the instance is meant to be shared.
 
 ```js
 const { connectNamed, listInstances } = await import("omowright");
@@ -41,11 +50,13 @@ const browser = await connectNamed("cloak-main", {
 });
 const page = await browser.newTab("https://target.com");
 await listInstances();
-// [{ name, pid, endpoint, profileDir, browserPath, startedAt, alive, responsive }]
+// [{ name, pid, endpoint, webSocketDebuggerUrl, profileDir, browserPath,
+//    startedAt, alive, responsive }]
 ```
 
-`close()` on the launcher terminates the browser; on an attached client it only
-detaches — the instance keeps running for the next `connectNamed`.
+`close()` on the launcher terminates the browser and removes its record; on an
+attached client it only detaches — the instance keeps running for the next
+`connectNamed`.
 `connectCloakProfile({ name })` and `omowright-cloak --name <name>` go through
 the same registry: same name, same instance. Without `name` both keep the
 zero-port pipe and never touch the registry.

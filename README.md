@@ -105,11 +105,14 @@ sleep to tune.
   `/json/*` endpoint and no listening TCP port exist for the driven browser.
   `connect(url)` attaches to an existing DevTools endpoint instead. Named
   instances are the one exception: they listen on a local `127.0.0.1` port
-  chosen by the OS (`--remote-debugging-port=0`), so the endpoint stays
-  loopback-only but attachable by name.
+  chosen by the OS (`--remote-debugging-port=0`). That keeps the endpoint off
+  the network, but it is unauthenticated — any local process can drive a named
+  browser, which a pipe-transport browser never allows.
 - **Named instances.** `connectNamed(name)` attaches to a live registered
   Chromium, relaunches a stale one, and errors naming the holder (name, pid,
-  endpoint) when it is unresponsive; `listInstances()` lists every registered
+  endpoint) when it is unresponsive; an attach requires the endpoint to answer
+  with the browser GUID recorded at launch, so a reused pid on a rebound port is
+  relaunched rather than driven. `listInstances()` lists every registered
   instance with liveness.
 - **Scoped endpoints.** An app can hand OmOWright a limited browser (say, one
   thread's tabs) behind a token: `connect(url, { client: { authorizer } })`
