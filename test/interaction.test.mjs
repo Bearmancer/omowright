@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, existsSync, globSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { createServer } from "node:http";
 import { connectPipe, createAgentTabs, createCua, createCaptcha } from "../src/index.js";
 
 function findHeadlessShell() {
@@ -145,5 +146,34 @@ test("captcha clicks checkbox, drags slider, and OCRs text region", { skip: !SHE
     }
   } finally {
     await cleanup();
+  }
+});
+
+// Public page API: clicking a target="_blank" link opens the new tab the way the browser does, so a QA script can attach
+// it from listTargets() (#56: the click threw "Popup tab control requires the extension bridge" on every transport).
+// Served over http: Chromium refuses a page-initiated top-level navigation to a data: URL.
+test("clicking a target=_blank link opens the linked page in a new tab", { skip: !SHELL && "no chromium binary found", timeout: 60000 }, async () => {
+  const site = createServer((req, res) => {
+    const body = req.url === "/linked"
+      ? "<title>Linked page</title><p>the linked page body text</p>"
+      : '<p>a page with one link and enough text</p><a id="blank" href="/linked" target="_blank">Open in a new tab</a>';
+    res.writeHead(200, { "content-type": "text/html" }).end(body);
+  });
+  await new Promise(resolve => site.listen(0, "127.0.0.1", resolve));
+  const origin = `http://127.0.0.1:${site.address().port}`;
+  const { connection, cleanup } = await launch();
+  try {
+    const page = (await createAgentTabs(connection).create("about:blank")).page;
+    await page.goto(`${origin}/`);
+    const opened = page.waitForEvent("popup", { timeout: 10000 });
+    await page.locator("#blank").click();
+    assert.equal((await opened).url, `${origin}/linked`, "the browser opened the linked URL");
+    const target = (await connection.listTargets()).find(t => t.url === `${origin}/linked`);
+    assert.ok(target, "the new tab is listed");
+    const tab = await connection.attachPage(target.id ?? target.targetId);
+    assert.equal(await tab.title(), "Linked page");
+  } finally {
+    await cleanup();
+    site.close();
   }
 });
