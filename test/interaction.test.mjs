@@ -103,6 +103,25 @@ test("cua drives coordinate click, type, keypress, and scroll", { skip: !SHELL &
   }
 });
 
+// Public page API: locator.screenshot() crops to the element plus its margin (#56: it threw "Invalid parameters" because
+// the margin argument received the element).
+test("locator.screenshot crops to the element and its margin", { skip: !SHELL && "no chromium binary found", timeout: 60000 }, async () => {
+  const { connection, cleanup } = await launch();
+  try {
+    const page = (await createAgentTabs(connection).create("about:blank")).page;
+    await page.goto(FIXTURE);
+    const size = (png) => ({ width: png.readUInt32BE(16), height: png.readUInt32BE(20) });
+    const tight = size(await page.locator("#btn").screenshot({ type: "png", margin: 0 }));
+    const scale = tight.width / 120;
+    assert.ok(scale > 0, "the element screenshot has a width");
+    assert.ok(Math.abs(tight.height / scale - 40) <= 1, `the crop is the 120x40 button (${tight.width}x${tight.height})`);
+    const padded = size(await page.locator("#btn").screenshot({ type: "png", margin: 10 }));
+    assert.ok(Math.abs(padded.width / scale - 140) <= 1 && Math.abs(padded.height / scale - 60) <= 1, `a 10px margin pads every side (${padded.width}x${padded.height})`);
+  } finally {
+    await cleanup();
+  }
+});
+
 test("captcha clicks checkbox, drags slider, and OCRs text region", { skip: !SHELL && "no chromium binary found", timeout: 90000 }, async () => {
   const { connection, cleanup } = await launch();
   try {
