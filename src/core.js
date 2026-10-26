@@ -705,7 +705,7 @@ function isWebSocketUrl(xn){return xn.startsWith(`ws://`)||xn.startsWith(`wss://
           throw new Error('$$eval pageFunction must evaluate to a function');
         }
         return await pageFunction(elements, arg);
-      }`,arguments:Zn,executionContextId:Jn.contextId,returnByValue:!0,awaitPromise:!0,userGesture:!1},await this.#e.resolveSessionId(Jn.frameSessionId));if(ei)throw Error(formatRuntimeException(ei,`$$eval failed`));return Qn.value}async boundingBox(){let xn=await this.#r();return await boundingBoxElement(this.#e,xn)}async screenshot(xn={}){let jn=xn.margin??DEFAULT_SCREENSHOT_MARGIN;if(!Number.isFinite(jn)||jn<0)throw Error(`locator.screenshot: margin must be a non-negative number`);let Vn=await this.#r(),qn=await evaluateOnElement(this.#e,Vn,`function(margin) {
+      }`,arguments:Zn,executionContextId:Jn.contextId,returnByValue:!0,awaitPromise:!0,userGesture:!1},await this.#e.resolveSessionId(Jn.frameSessionId));if(ei)throw Error(formatRuntimeException(ei,`$$eval failed`));return Qn.value}async boundingBox(){let xn=await this.#r();return await boundingBoxElement(this.#e,xn)}async screenshot(xn={}){let jn=xn.margin??DEFAULT_SCREENSHOT_MARGIN;if(!Number.isFinite(jn)||jn<0)throw Error(`locator.screenshot: margin must be a non-negative number`);let Vn=await this.#r(),qn=await evaluateOnElement(this.#e,Vn,`function(_, margin) {
         const rect = this.getBoundingClientRect();
         if (rect.width <= 0 || rect.height <= 0) {
           return null;
