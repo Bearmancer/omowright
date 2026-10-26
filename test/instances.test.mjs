@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { connectNamed, listInstances } from "../src/instances.js";
+import { reclaimLock } from "../src/instance-lock.js";
 
 const fixture = fileURLToPath(
   new URL("./fixtures/fake-named-browser.mjs", import.meta.url),
@@ -495,6 +496,73 @@ test("connectNamed treats an identity-less lock as held until it ages out", asyn
     );
   } finally {
     await connection?.close().catch(() => {});
+    await rm(registryRoot, { recursive: true, force: true });
+  }
+});
+
+// Contract owner: what counts as an abandoned lock. A live pid alone is not the
+// holder: once the holder dies its pid can be handed to an unrelated process,
+// and a pid-only check would keep the name locked until that process exits.
+test("connectNamed reclaims a lock whose pid now belongs to another process", async () => {
+  const registryRoot = await mkdtemp(
+    path.join(tmpdir(), "omowright-instances-"),
+  );
+  const lockPath = path.join(registryRoot, "reused.lock");
+  const unrelated = await launchFakeBrowser();
+  let connection;
+  try {
+    await writeFile(
+      lockPath,
+      `${JSON.stringify({
+        pid: unrelated.child.pid,
+        start: "a start time this pid never had",
+        token: "crashed-holder",
+        acquiredAt: new Date().toISOString(),
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    connection = await connectNamed("reused", {
+      registryRoot,
+      browserPath: process.execPath,
+      browserArgs: [fixture],
+      lockTimeoutMs: 3_000,
+    });
+
+    assert.equal(connection.browserProcess?.pid > 0, true);
+    assert.notEqual(connection.browserProcess.pid, unrelated.child.pid);
+    assert.doesNotThrow(() => process.kill(unrelated.child.pid, 0));
+  } finally {
+    await connection?.close().catch(() => {});
+    await stopChild(unrelated.child);
+    await rm(registryRoot, { recursive: true, force: true });
+  }
+});
+
+// Contract owner: the takeover never deletes a live lock. Filesystems such as
+// ext4 reuse inode numbers, so a reclaimer that inspected a dead lock can later
+// find a new holder's lock under the same inode; the token written into every
+// lock is what tells them apart. Test seam: reclaimLock is called directly
+// because no timing can force an inode to be reused.
+test("reclaimLock leaves a live lock that reuses the dead lock's inode", async () => {
+  const registryRoot = await mkdtemp(
+    path.join(tmpdir(), "omowright-instances-"),
+  );
+  const lockPath = path.join(registryRoot, "reused-inode.lock");
+  const live = `${JSON.stringify({
+    pid: process.pid,
+    token: "live-holder",
+    acquiredAt: new Date().toISOString(),
+  })}\n`;
+  try {
+    await writeFile(lockPath, live, { mode: 0o600 });
+    const { ino } = await stat(lockPath);
+
+    assert.equal(await reclaimLock(lockPath, ino, "dead-holder"), false);
+
+    assert.equal(await readFile(lockPath, "utf8"), live);
+    assert.deepEqual(await readdir(registryRoot), ["reused-inode.lock"]);
+  } finally {
     await rm(registryRoot, { recursive: true, force: true });
   }
 });
