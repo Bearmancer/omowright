@@ -3,7 +3,10 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, existsSync, globSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { PipeCdpClient, connectPipe } from "../src/pipe.js";
+import { connect } from "../src/index.js";
 import { BrowserConnection } from "../src/connection.js";
 import { resolveDialogAction } from "../src/dialog-policy.js";
 import { createAgentTabs } from "../src/agent-tabs.js";
@@ -154,6 +157,51 @@ test("live dialogPolicy dismisses confirm, fills prompt, and still emits dialog"
     assert.equal(await prompted, "hello");
   } finally {
     await connection.close();
+    rmSync(ud, { recursive: true, force: true });
+  }
+});
+
+// Public API: connect() over WebSocket takes the same dialog policy as connectPipe(), so a QA script on an attached
+// endpoint (the OmO desktop thread browser) can take the cancel path of a confirm() and answer a prompt() (#56).
+test("live connect() honours dialogPolicy over WebSocket", {
+  skip: !SHELL && "no chromium binary found",
+  timeout: 60_000,
+}, async () => {
+  const ud = mkdtempSync(path.join(tmpdir(), "omowright-dialogs-ws-"));
+  const browser = spawn(SHELL, ["--headless", "--no-first-run", "--remote-debugging-port=0", `--user-data-dir=${ud}`, "about:blank"], {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let connection;
+  try {
+    const wsUrl = await new Promise((resolve, reject) => {
+      let buffered = "";
+      browser.stderr.on("data", chunk => {
+        buffered += chunk;
+        const match = /DevTools listening on (ws:\/\/\S+)/.exec(buffered);
+        if (match) resolve(match[1]);
+      });
+      browser.once("exit", code => reject(new Error(`chromium exited early (${code})`)));
+    });
+    connection = await connect(wsUrl.replace(/^ws:/, "http:").replace(/\/devtools\/.*$/, ""), {
+      storageRoot: ud,
+      dialogPolicy: { accept: false },
+    });
+    const page = (await createAgentTabs(connection).create("about:blank")).page;
+
+    const confirmDialog = page.waitForEvent("dialog", { timeout: 5000 });
+    const confirmed = page.evaluate(() => confirm("x"));
+    assert.equal((await confirmDialog).type, "confirm");
+    assert.equal(await confirmed, false, "the policy dismissed the confirm");
+
+    connection.setDialogPolicy({ accept: true, promptText: "hello" });
+    assert.deepEqual(connection.cdp.dialogPolicy, { accept: true, promptText: "hello" });
+    const prompted = page.evaluate(() => prompt("q"));
+    assert.equal(await prompted, "hello", "the policy answered the prompt");
+  } finally {
+    await connection?.close().catch(() => {});
+    const exited = browser.exitCode === null ? once(browser, "exit") : Promise.resolve();
+    browser.kill();
+    await exited;
     rmSync(ud, { recursive: true, force: true });
   }
 });

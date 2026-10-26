@@ -99,6 +99,6 @@ export async function connect(cdpHttpUrl, options = {}) {
   if (typeof cdpHttpUrl !== "string" || cdpHttpUrl.length === 0) {
     throw new TypeError("connect(cdpHttpUrl) requires a Chromium CDP HTTP URL");
   }
-  const client = new CdpClient({ cdpUrl: cdpHttpUrl, ...options.client });
+  const client = new CdpClient({ cdpUrl: cdpHttpUrl, dialogPolicy: options.dialogPolicy, ...options.client });
   return new BrowserConnection(client, options).initialize();
 }

@@ -129,7 +129,7 @@ Preset and `TOOLS.md` paths are relative to the package root.
   `page.locator("f1e3")`; never fetch a frame handle to click inside an iframe.
 - Dialogs never block: `alert/confirm/prompt/beforeunload` are answered by the
   dialog policy (default accept: `confirm() -> true`, `prompt() -> ""`). Change
-  it with `connectPipe({ dialogPolicy })` or `browser.setDialogPolicy()`;
+  it with `connectPipe({ dialogPolicy })`, `connect(url, { dialogPolicy })` or `browser.setDialogPolicy()`;
   observe with `page.on('dialog')`. Details in `TOOLS.md`.
 - `goto` waits for meaningful content, not `readyState`: body plus (interactive
   elements OR landmarks OR >= 20 text chars). Near-empty pages time out — use
