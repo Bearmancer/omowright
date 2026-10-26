@@ -180,7 +180,9 @@ async function assertCloakLaunchClear({
     if (!record.alive || !record.responsive) continue;
     if (!record.profileDir) continue;
     if (path.resolve(record.profileDir) === path.resolve(profileDir)) continue;
-    if (record.browserPath !== browserPath) continue;
+    // Records store a resolved path; the caller's may be relative or spelled
+    // differently, and an unresolved compare would skip the guard.
+    if (path.resolve(record.browserPath) !== path.resolve(browserPath)) continue;
     throw new Error(
       `CloakBrowser allows one instance: "${record.name}" (pid ${record.pid}, profile ${record.profileDir}) is live — connectNamed("${record.name}") to reuse it or close it first`,
     );

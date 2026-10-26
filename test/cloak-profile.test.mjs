@@ -208,18 +208,22 @@ async function startFakeNamedBrowser() {
   const child = spawn(process.execPath, [fakeNamedBrowser], {
     stdio: ["ignore", "ignore", "pipe"],
   });
-  const endpoint = await new Promise((resolve, reject) => {
+  const webSocketDebuggerUrl = await new Promise((resolve, reject) => {
     let buffered = "";
     child.stderr.on("data", (chunk) => {
       buffered += chunk;
       const match = /DevTools listening on (ws:\/\/\S+)/.exec(buffered);
-      if (match) {
-        resolve(match[1].replace(/^ws:/, "http:").replace(/\/devtools\/.*$/, ""));
-      }
+      if (match) resolve(match[1]);
     });
     child.once("exit", (code) => reject(new Error(`fake browser exited (${code})`)));
   });
-  return { child, endpoint };
+  return {
+    child,
+    webSocketDebuggerUrl,
+    endpoint: webSocketDebuggerUrl
+      .replace(/^ws:/, "http:")
+      .replace(/\/devtools\/.*$/, ""),
+  };
 }
 
 test("named cloak launch names a healthy different-profile holder", async () => {
@@ -231,12 +235,15 @@ test("named cloak launch names a healthy different-profile holder", async () => 
     writeFileSync(
       path.join(registryRoot, "holder.json"),
       JSON.stringify({
-        version: 1,
+        version: 2,
         name: "holder",
         pid: process.pid,
         endpoint: fake.endpoint,
+        webSocketDebuggerUrl: fake.webSocketDebuggerUrl,
         profileDir: otherDir,
-        browserPath: process.execPath,
+        // Records store a resolved path; this spelling of the same binary must
+        // still be recognized as the engine the launch would collide with.
+        browserPath: `${path.dirname(process.execPath)}/./${path.basename(process.execPath)}`,
         startedAt: new Date().toISOString(),
       }),
     );
@@ -245,10 +252,11 @@ test("named cloak launch names a healthy different-profile holder", async () => 
     writeFileSync(
       path.join(registryRoot, "generic.json"),
       JSON.stringify({
-        version: 1,
+        version: 2,
         name: "generic",
         pid: process.pid,
         endpoint: fake.endpoint,
+        webSocketDebuggerUrl: fake.webSocketDebuggerUrl,
         profileDir: null,
         browserPath: process.execPath,
         startedAt: new Date().toISOString(),
