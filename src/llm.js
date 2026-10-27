@@ -130,7 +130,7 @@ export const toolSchemas = [
   },
   {
     name: "connectPipe.dialogPolicy",
-    description: "Wire connectPipe({dialogPolicy}) and client.setDialogPolicy to {accept,promptText} or (dialog)=>boolean|{accept,promptText}; throwing policy accepts. WebSocket connect() keeps auto-accept.",
+    description: "Wire connectPipe({dialogPolicy}), connect(url, {dialogPolicy}) and setDialogPolicy to {accept,promptText} or (dialog)=>boolean|{accept,promptText}; a throwing policy accepts.",
     parameters: { type: "object", properties: { accept: { type: "boolean" }, promptText: { type: "string" } } },
   },
   {

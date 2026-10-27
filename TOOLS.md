@@ -143,8 +143,8 @@ loop; the module files next to it are implementation detail.
   `{ url, method, resourceType, headers }`. The handler receives `{ request,
   continue(overrides), fulfill({ status, headers, contentType, body }),
   abort(reason) }`. `Fetch.enable` is sent on the first `route()` only.
-- Dialog policy: `connectPipe({ dialogPolicy })`, `new PipeCdpClient({
-  dialogPolicy })`, `client.setDialogPolicy(policy)`, `client.dialogPolicy`,
+- Dialog policy: `connectPipe({ dialogPolicy })`, `connect(url, { dialogPolicy })`,
+  `new PipeCdpClient({ dialogPolicy })`, `client.setDialogPolicy(policy)`, `client.dialogPolicy`,
   `BrowserConnection.setDialogPolicy(policy)`. Pure helpers in
   `src/dialog-policy.js`: `normalizeDialogPolicy(policy)`,
   `resolveDialogAction(policy, dialogParams)`. See "Dialogs" below.
@@ -211,7 +211,7 @@ browser.setDialogPolicy(dialog => {               // { type, message, defaultPro
   if (dialog.type === "beforeunload") return true;
   return { accept: !/delete/i.test(dialog.message), promptText: dialog.defaultPrompt };
 });
-browser.cdp.dialogPolicy;                         // read the current policy (pipe client getter)
+browser.cdp.dialogPolicy;                         // read the current policy (client getter)
 ```
 
 - `{ accept: false }` dismisses: `confirm()` returns `false`, `prompt()` returns
@@ -220,9 +220,9 @@ browser.cdp.dialogPolicy;                         // read the current policy (pi
 - A function policy may return `boolean` or `{ accept, promptText }`, sync or
   async. A policy that throws falls back to accept, so a bug in the policy
   cannot hang the page.
-- `connectPipe({ dialogPolicy })` sets it at launch; `browser.setDialogPolicy()`
-  swaps it later (it forwards to the pipe client and throws for a transport
-  without policy support). `connect()` over WebSocket keeps plain auto-accept.
+- `connectPipe({ dialogPolicy })` and `connect(url, { dialogPolicy })` set it
+  up front; `browser.setDialogPolicy()` swaps it later (it forwards to the pipe
+  or WebSocket client and throws for a transport without policy support).
 - Subscribe to `page.on('dialog', d => ...)` for observability: the event
   carries `{type, message, defaultPrompt, url}` and fires after the policy runs.
 
