@@ -81,6 +81,9 @@ loop; the module files next to it are implementation detail.
   wait is bounded: discovery by `probeTimeoutMs`, the launch by
   `launchTimeoutMs`, the CDP handshake by `connectTimeoutMs`, the registry lock
   by `lockTimeoutMs` (default: the other three plus a margin).
+  The registry lock has two known races when a takeover meets a live holder:
+  two callers can hold a name for a moment, and a released lock can come back
+  and block the name until its holder's process exits (tracked in #62).
   **The named endpoint is unauthenticated.** CDP listens on 127.0.0.1 with a
   kernel-chosen port: off the network, but any local process or user can drive
   that browser. Name-less launches (`connectPipe`, `connectCloakProfile()`
