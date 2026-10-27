@@ -17,6 +17,9 @@ Options:
   --seed <10000-99999>
                      Pin the fingerprint seed on first use
   --browser <path>   CloakBrowser Chromium binary path
+  --name <name>      Register as a named instance; attach when already live.
+                     A named browser listens on an unauthenticated 127.0.0.1
+                     CDP port; without --name there is no port at all.
   --url <url>        Open a URL (default: about:blank)
   --once             Print state, close the browser, preserve the profile
   --snapshot         Include an interactive accessibility snapshot
@@ -41,7 +44,7 @@ function parseArgs(argv) {
       options.snapshot = true;
       continue;
     }
-    if (["--profile", "--seed", "--browser", "--url"].includes(arg)) {
+    if (["--profile", "--seed", "--browser", "--name", "--url"].includes(arg)) {
       const value = argv[++index];
       if (!value) throw new Error(`${arg} requires a value`);
       options[arg.slice(2)] = value;
@@ -84,6 +87,7 @@ try {
     profileDir,
     fingerprintSeed: profile.fingerprintSeed,
     browserPath: options.browser,
+    name: options.name,
   });
   const page = await browser.newTab(options.url);
   const result = {
