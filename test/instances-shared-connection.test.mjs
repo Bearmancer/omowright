@@ -11,7 +11,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { WebSocketServer } from "ws";
 import { connectNamed } from "../src/instances.js";
-import { SharedConnectionError } from "../src/shared-connections.js";
+import * as sharedConnections from "../src/shared-connections.js";
 
 // A browser that answers discovery with its current GUID and, like Chrome,
 // only upgrades the WebSocket path of that GUID.
@@ -228,7 +228,8 @@ const holderCases = [
       const changing = await connectAs();
       await connectAs();
       assert.throws(() => path.set(changing, { accept: false }), (error) => {
-        assert.ok(error instanceof SharedConnectionError);
+        assert.equal(error?.name, "SharedConnectionError");
+        assert.ok(error instanceof sharedConnections.SharedConnectionError);
         assert.equal(error.code, "shared_connection");
         assert.match(error.message, /pass dialogPolicy to connect\(\)\/connectNamed\(\)/);
         return true;
