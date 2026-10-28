@@ -19,6 +19,7 @@ import { connectNamed } from "../src/instances.js";
 async function fakeCdpEndpoint() {
   let guid = "first";
   const upgrades = [];
+  const authorizations = [];
   const sockets = new Set();
   const server = createServer((request, response) => {
     const body = request.url === "/json/version"
@@ -36,6 +37,7 @@ async function fakeCdpEndpoint() {
     }
     webSockets.handleUpgrade(request, socket, head, (webSocket) => {
       upgrades.push(guid);
+      authorizations.push(request.headers.authorization ?? null);
       sockets.add(webSocket);
       webSocket.on("close", () => sockets.delete(webSocket));
       webSocket.on("message", (data) => {
@@ -53,6 +55,7 @@ async function fakeCdpEndpoint() {
   return {
     endpoint,
     upgrades,
+    authorizations,
     sockets,
     webSocketUrl,
     // The browser behind the port is now another one. Open sockets are kept,
@@ -196,3 +199,61 @@ for (const attachPath of attachPaths) {
     });
   });
 }
+
+// connect(url) leases are keyed by the browser GUID, so the connection behind a
+// key must never end up serving another browser (#79 review). Short reconnect
+// delays keep the doomed reconnects to the vanished GUID quick.
+test("connect(url) never leases a connection that would serve a different browser", async () => {
+  await withFakeBrowser(attachPaths[1], async ({ fake }) => {
+    const options = { client: { reconnectDelaysMs: [0, 50] } };
+    const oldUrl = fake.webSocketUrl();
+    const first = await connect(fake.endpoint, options);
+    let stale;
+    let fresh;
+    try {
+      const dropped = nextTransportEvent(first, "disconnected");
+      fake.becomeBrowser("second");
+      fake.dropConnections();
+      await dropped;
+
+      const error = await connect(oldUrl, options).then((attached) => {
+        stale = attached;
+        return null;
+      }, (rejection) => rejection);
+      assert.ok(error instanceof Error, "an attach to the vanished browser must fail, not lease");
+      assert.deepEqual(fake.upgrades, ["first"]);
+
+      // The failed entry is evicted, so the endpoint resolves anew.
+      fresh = await connect(fake.endpoint, options);
+      await fresh.cdp.send("Browser.getVersion");
+      assert.deepEqual(fake.upgrades, ["first", "second"]);
+    } finally {
+      await Promise.all([first, stale, fresh].map((c) => c?.close().catch(() => {})));
+    }
+  });
+});
+
+// Security contract (#79 review): an authorizer is a credential, and two of them
+// can hide different tokens behind equal-looking objects. Each caller gets its
+// own connection, authorized with its own token.
+test("connect(url) never shares one connection across two authorizers", async () => {
+  class TokenAuthorizer {
+    #token;
+    constructor(token) {
+      this.#token = token;
+    }
+    async resolveAuthorization() {
+      return `Bearer ${this.#token}`;
+    }
+  }
+  await withFakeBrowser(attachPaths[1], async ({ fake }) => {
+    const a = await connect(fake.endpoint, { client: { authorizer: new TokenAuthorizer("thread-a") } });
+    const b = await connect(fake.endpoint, { client: { authorizer: new TokenAuthorizer("thread-b") } });
+    try {
+      assert.notEqual(a.cdp, b.cdp);
+      assert.deepEqual(fake.authorizations, ["Bearer thread-a", "Bearer thread-b"]);
+    } finally {
+      await Promise.all([a, b].map((c) => c.close().catch(() => {})));
+    }
+  });
+});

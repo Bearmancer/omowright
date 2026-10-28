@@ -114,6 +114,16 @@ sleep to tune.
   with the browser GUID recorded at launch, so a reused pid on a rebound port is
   relaunched rather than driven. `listInstances()` lists every registered
   instance with liveness.
+- **Shared attaches.** Chrome asks the user to allow remote debugging once per
+  connection to their own profile, so `connect(url)` and `connectNamed`
+  attaches in one process share one CDP connection per browser (keyed by its
+  GUID). Each call returns a handle on it: `close()` RELEASES that handle, and
+  only the last release disconnects. Everything on the connection is shared by
+  every handle: `setDialogPolicy` changes it for all of them, and pages attached
+  through one handle stay attached until the last release. A connection is never
+  shared when an `authorizer` (or any non-plain client option) is set, nor
+  between callers whose options differ, and a reconnect never reaches a browser
+  other than the one the handle was opened for.
 - **Scoped endpoints.** An app can hand OmOWright a limited browser (say, one
   thread's tabs) behind a token: `connect(url, { client: { authorizer } })`
   sends `Authorization` from `authorizer.resolveAuthorization({ forceRefresh })`

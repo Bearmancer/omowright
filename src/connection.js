@@ -6,7 +6,7 @@ import {
   OmOPage,
   SessionManager,
 } from "./core.js";
-import { acquireSharedConnection } from "./shared-connections.js";
+import { acquireSharedConnection, canShareConnection } from "./shared-connections.js";
 
 export class TabRepository {
   #client;
@@ -125,7 +125,11 @@ export async function openConnection(cdpHttpUrl, options = {}) {
 
 export async function connect(cdpHttpUrl, options = {}) {
   const client = createClient(cdpHttpUrl, options);
-  return acquireSharedConnection(await browserKey(client, cdpHttpUrl), options, {
-    open: () => new BrowserConnection(client, options).initialize(),
+  if (!canShareConnection(options)) return new BrowserConnection(client, options).initialize();
+  const key = await browserKey(client, cdpHttpUrl);
+  // Opened on the resolved GUID URL, never the port: a reconnect then reaches
+  // only this browser, and fails once it is gone (#79 review).
+  return acquireSharedConnection(key, options, {
+    open: () => openConnection(key, options),
   });
 }

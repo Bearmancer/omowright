@@ -44,6 +44,25 @@ function lease(key, entry, connection) {
   });
 }
 
+// Only plain data is compared structurally. A class instance (an authorizer
+// holding its token in a private field, say) compares equal to another one
+// with different hidden state, so such options are never shared; functions
+// compare by identity, which is exact.
+function isPlainData(value) {
+  if (typeof value === "function") return true;
+  if (value === null || typeof value !== "object") return true;
+  if (Array.isArray(value)) return value.every(isPlainData);
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return false;
+  return Object.values(value).every(isPlainData);
+}
+
+// An authorizer is a credential: two callers never share one connection
+// through it, even with the same authorizer object (#79 review).
+export function canShareConnection(options) {
+  return options?.client?.authorizer === undefined && isPlainData(options);
+}
+
 // `open(options)` makes the real connection; it runs once per browser while a
 // lease is held. A caller whose connection options differ from the shared
 // connection's gets a connection of its own rather than someone else's
@@ -53,6 +72,7 @@ export async function acquireSharedConnection(
   options,
   { open, timeoutMs },
 ) {
+  if (!canShareConnection(options)) return open(options);
   let entry = shared.get(webSocketDebuggerUrl);
   if (entry && !isDeepStrictEqual(entry.options, options)) return open(options);
   if (!entry) {
@@ -74,6 +94,9 @@ export async function acquireSharedConnection(
         ));
     return lease(webSocketDebuggerUrl, entry, connection);
   } catch (error) {
+    // The browser behind this key is gone or unreachable: evict the entry so
+    // the next attach resolves and opens anew instead of joining a dead one.
+    if (shared.get(webSocketDebuggerUrl) === entry) shared.delete(webSocketDebuggerUrl);
     await release(webSocketDebuggerUrl, entry);
     throw error;
   }
