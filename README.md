@@ -126,10 +126,10 @@ sleep to tune.
   `setDialogPolicy` works and that connection is never shared again, and
   properties, client writes and listeners stay with the handle. A connection
   is never shared when an `authorizer` (or any non-plain client option) is
-  set, nor between callers whose options differ (`dialogPolicy` included). A shared handle's reconnect never
-  reaches a browser other than the one it was opened for; an unshared
-  connection (one with an authorizer, say) reconnects to whatever answers on
-  its URL.
+  set, nor between callers whose options differ (`dialogPolicy` included). A
+  shared handle's reconnect never reaches a browser other than the one it
+  was opened for; an unshared connection (one with an authorizer, say)
+  reconnects to whatever answers on its URL.
 - **Scoped endpoints.** An app can hand OmOWright a limited browser (say, one
   thread's tabs) behind a token: `connect(url, { client: { authorizer } })`
   sends `Authorization` from `authorizer.resolveAuthorization({ forceRefresh })`
