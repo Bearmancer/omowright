@@ -118,11 +118,15 @@ sleep to tune.
   connection to their own profile, so `connect(url)` and `connectNamed`
   attaches in one process share one CDP connection per browser (keyed by its
   GUID). Each call returns a handle on it: `close()` RELEASES that handle, and
-  only the last release disconnects. Everything on the connection is shared by
-  every handle: `setDialogPolicy` changes it for all of them, and pages attached
-  through one handle stay attached until the last release. A connection is never
-  shared when an `authorizer` (or any non-plain client option) is set, nor
-  between callers whose options differ. A shared handle's reconnect never
+  only the last release disconnects. Pages attached through one handle are the
+  same pages for every handle and stay attached until the last release. A
+  handle never changes what another holder gets: on a shared connection
+  `setDialogPolicy` throws `SharedConnectionError` (pass `dialogPolicy` when
+  attaching to get a connection of your own), a sole holder's
+  `setDialogPolicy` works and that connection is never shared again, and
+  properties, client writes and listeners stay with the handle. A connection
+  is never shared when an `authorizer` (or any non-plain client option) is
+  set, nor between callers whose options differ (`dialogPolicy` included). A shared handle's reconnect never
   reaches a browser other than the one it was opened for; an unshared
   connection (one with an authorizer, say) reconnects to whatever answers on
   its URL.
