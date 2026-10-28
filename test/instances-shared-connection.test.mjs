@@ -428,6 +428,56 @@ const holderCases = [
       assert.deepEqual(fake.upgrades, ["first"]);
     },
   },
+  {
+    label: "clearListeners through a handle removes only that handle's transport listeners",
+    async run({ fake, connectAs }) {
+      const clearing = await connectAs();
+      const other = await connectAs();
+      const heard = [];
+      clearing.cdp.transportEvents.on("disconnected", () => heard.push("clearing"));
+      other.cdp.transportEvents.on("disconnected", () => heard.push("other"));
+      clearing.cdp.transportEvents.clearListeners();
+      const dropped = nextTransportEvent(other, "disconnected");
+      fake.dropConnections();
+      await dropped;
+      assert.deepEqual(heard, ["other"]);
+    },
+  },
+  {
+    label: "emit through a handle is refused",
+    async run({ connectAs }) {
+      const emitting = await connectAs();
+      const other = await connectAs();
+      const heard = [];
+      other.cdp.transportEvents.on("disconnected", () => heard.push("other"));
+      assert.throws(() => emitting.cdp.transportEvents.emit("disconnected"), TypeError);
+      assert.deepEqual(heard, []);
+    },
+  },
+  {
+    label: "a handle's reserved members cannot be replaced",
+    async run({ connectAs }) {
+      const handle = await connectAs();
+      for (const member of ["cdp", "close", "setDialogPolicy"]) {
+        assert.throws(() => {
+          handle[member] = () => {};
+        }, TypeError, member);
+        assert.throws(() => Object.defineProperty(handle, member, { value: 1, configurable: true }), TypeError, member);
+      }
+    },
+  },
+  {
+    label: "a handle's own keys and descriptors show what was set on it",
+    async run({ connectAs }) {
+      const writer = await connectAs();
+      const other = await connectAs();
+      writer.marker = "set";
+      assert.ok(Object.keys(writer).includes("marker"));
+      assert.equal(Object.getOwnPropertyDescriptor(writer, "marker")?.value, "set");
+      assert.ok(!Object.keys(other).includes("marker"));
+      assert.equal(Object.getOwnPropertyDescriptor(other, "marker"), undefined);
+    },
+  },
 ];
 
 for (const attachPath of attachPaths) {

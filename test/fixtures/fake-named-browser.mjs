@@ -1,4 +1,6 @@
+import { writeFileSync } from "node:fs";
 import { createServer } from "node:http";
+import path from "node:path";
 import { WebSocketServer } from "ws";
 
 const target = {
@@ -69,9 +71,26 @@ function shutdown() {
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);
 
+function flag(name) {
+  const prefix = `--${name}=`;
+  return process.argv.find((arg) => arg.startsWith(prefix))?.slice(prefix.length);
+}
+
+// Like Chromium: DevToolsActivePort in the user data dir, then the stderr line.
+// --fake-quiet drops the stderr line (chrome.exe on Windows has none), and
+// --fake-active-port writes another port, as a second browser on the dir would.
 server.listen(0, "127.0.0.1", () => {
   const port = server.address().port;
-  process.stderr.write(
-    `DevTools listening on ws://127.0.0.1:${port}/devtools/browser/fake\n`,
-  );
+  const userDataDir = flag("user-data-dir");
+  if (userDataDir) {
+    writeFileSync(
+      path.join(userDataDir, "DevToolsActivePort"),
+      `${flag("fake-active-port") ?? port}\n/devtools/browser/fake`,
+    );
+  }
+  if (!process.argv.includes("--fake-quiet")) {
+    process.stderr.write(
+      `DevTools listening on ws://127.0.0.1:${port}/devtools/browser/fake\n`,
+    );
+  }
 });

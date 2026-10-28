@@ -43,6 +43,9 @@ export class SharedConnectionError extends Error {
   }
 }
 
+// Members the lease itself provides; a handle can't replace them.
+const RESERVED = new Set(["cdp", "close", "setDialogPolicy"]);
+
 function refuse(what) {
   return (_target, property) => {
     throw new TypeError(`cannot change ${String(property)} on ${what} through a handle: every holder of this connection uses it`);
@@ -97,9 +100,28 @@ function lease(key, entry, connection) {
     deleteProperty: refuse(what),
   });
   const client = connection.cdp;
+  // Transport events reach every holder: through a handle, clearListeners
+  // removes only that handle's listeners and emit is refused.
+  const transportSubscriptions = [];
   const transportEvents = new Proxy(client.transportEvents, readOnly("the shared transport events", (target, property) => {
     ensureOpen(property);
-    if (property === "on") return tracked(target.on.bind(target));
+    if (property === "on") {
+      return (...args) => {
+        const unsubscribe = tracked(target.on.bind(target))(...args);
+        transportSubscriptions.push(unsubscribe);
+        return unsubscribe;
+      };
+    }
+    if (property === "clearListeners") {
+      return () => {
+        for (const unsubscribe of transportSubscriptions.splice(0)) unsubscribe();
+      };
+    }
+    if (property === "emit") {
+      return () => {
+        throw new TypeError("cannot emit transport events through a handle: every holder of this connection hears them");
+      };
+    }
     return bindTo(target, Reflect.get(target, property, target));
   }));
   const clientView = new Proxy(client, readOnly("the shared CDP client", (target, property) => {
@@ -119,12 +141,14 @@ function lease(key, entry, connection) {
       if (Object.hasOwn(overlay, property)) return overlay[property];
       return bindTo(target, Reflect.get(target, property, target));
     },
-    set(_target, property, value) {
+    set(target, property, value) {
       ensureOpen(property);
+      if (RESERVED.has(property)) return refuse("a handle")(target, property);
       return Reflect.set(overlay, property, value);
     },
-    defineProperty(_target, property, descriptor) {
+    defineProperty(target, property, descriptor) {
       ensureOpen(property);
+      if (RESERVED.has(property)) return refuse("a handle")(target, property);
       // A non-configurable property can't live on the lease alone.
       if (descriptor.configurable !== true) return false;
       return Reflect.defineProperty(overlay, property, descriptor);
@@ -136,6 +160,14 @@ function lease(key, entry, connection) {
     },
     has(target, property) {
       return Object.hasOwn(overlay, property) || Reflect.has(target, property);
+    },
+    ownKeys(target) {
+      return [...new Set([...Reflect.ownKeys(target), ...Reflect.ownKeys(overlay)])];
+    },
+    getOwnPropertyDescriptor(target, property) {
+      return Object.hasOwn(overlay, property)
+        ? Reflect.getOwnPropertyDescriptor(overlay, property)
+        : Reflect.getOwnPropertyDescriptor(target, property);
     },
   });
 }

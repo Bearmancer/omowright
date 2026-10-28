@@ -20,6 +20,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 import { test } from "node:test";
+import { WebSocketServer } from "ws";
 import { connectNamed, listInstances } from "../src/instances.js";
 import { reclaimLock, withLock } from "../src/instance-lock.js";
 
@@ -697,6 +698,112 @@ test("connectNamed relaunches when a stranger answers on the recorded endpoint",
   } finally {
     await connection?.close().catch(() => {});
     await stopChild(stranger.child);
+    await rm(registryRoot, { recursive: true, force: true });
+  }
+});
+
+// Another browser's CDP endpoint: answers discovery as itself and counts every
+// WebSocket upgrade, so a launch that dials it is caught.
+async function decoyEndpoint() {
+  const upgrades = [];
+  const server = createServer((request, response) => {
+    if (request.url !== "/json/version") return void response.writeHead(404).end();
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify({
+      Browser: "Decoy/1.0",
+      webSocketDebuggerUrl: `ws://127.0.0.1:${server.address().port}/devtools/browser/decoy`,
+    }));
+  });
+  const webSockets = new WebSocketServer({ noServer: true });
+  server.on("upgrade", (request, socket, head) => {
+    webSockets.handleUpgrade(request, socket, head, (webSocket) => {
+      upgrades.push(request.url);
+      webSocket.on("message", (data) => {
+        const { id } = JSON.parse(data.toString());
+        webSocket.send(JSON.stringify({ id, result: {} }));
+      });
+    });
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  return {
+    port: server.address().port,
+    upgrades,
+    async close() {
+      for (const webSocket of webSockets.clients) webSocket.terminate();
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    },
+  };
+}
+
+// Contract owner: launch endpoint identity (#74). A DevToolsActivePort that was
+// in the profile before the launch belongs to an earlier run or to another
+// browser on that profile (a user's Chrome writes one when remote debugging is
+// enabled), so the launch must never dial the port it names.
+test("connectNamed ignores a DevToolsActivePort left before the launch", async () => {
+  const registryRoot = await mkdtemp(path.join(tmpdir(), "omowright-instances-"));
+  const profileDir = path.join(registryRoot, "profile");
+  await mkdir(profileDir);
+  const decoy = await decoyEndpoint();
+  const stalePort = path.join(profileDir, "DevToolsActivePort");
+  await writeFile(stalePort, `${decoy.port}\n/devtools/browser/decoy`);
+  const past = new Date(Date.now() - 60_000);
+  await utimes(stalePort, past, past);
+  let connection;
+  try {
+    connection = await connectNamed("stale-port", {
+      registryRoot,
+      browserPath: process.execPath,
+      browserArgs: [fixture, `--user-data-dir=${profileDir}`],
+      profileDir,
+    });
+
+    assert.deepEqual(await connection.listTargets(), [fakeTarget]);
+    const record = JSON.parse(await readFile(path.join(registryRoot, "stale-port.json"), "utf8"));
+    assert.equal(record.pid, connection.browserProcess.pid);
+    assert.notEqual(record.endpoint, `http://127.0.0.1:${decoy.port}`);
+    assert.deepEqual(decoy.upgrades, []);
+  } finally {
+    await connection?.close().catch(() => {});
+    await decoy.close();
+    await rm(registryRoot, { recursive: true, force: true });
+  }
+});
+
+test("connectNamed refuses a launch endpoint that answers as another browser", async () => {
+  const registryRoot = await mkdtemp(path.join(tmpdir(), "omowright-instances-"));
+  const profileDir = path.join(registryRoot, "profile");
+  await mkdir(profileDir);
+  const decoy = await decoyEndpoint();
+  let connection;
+  try {
+    const error = await connectNamed("foreign-port", {
+      registryRoot,
+      browserPath: process.execPath,
+      browserArgs: [
+        fixture,
+        `--user-data-dir=${profileDir}`,
+        "--fake-quiet",
+        `--fake-active-port=${decoy.port}`,
+      ],
+      profileDir,
+    }).then((attached) => {
+      connection = attached;
+      return null;
+    }, (rejection) => rejection);
+    assert.deepEqual(decoy.upgrades, []);
+    assert.match(
+      String(error?.message),
+      /answers as \/devtools\/browser\/decoy, not as the launched browser \(\/devtools\/browser\/fake\)/,
+    );
+    await assert.rejects(
+      stat(path.join(registryRoot, "foreign-port.json")),
+      (error) => error?.code === "ENOENT",
+    );
+  } finally {
+    await connection?.close().catch(() => {});
+    await decoy.close();
     await rm(registryRoot, { recursive: true, force: true });
   }
 });
