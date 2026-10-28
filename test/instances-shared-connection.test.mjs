@@ -11,6 +11,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { WebSocketServer } from "ws";
 import { connectNamed } from "../src/instances.js";
+import { SharedConnectionError } from "../src/shared-connections.js";
 
 // A browser that answers discovery with its current GUID and, like Chrome,
 // only upgrades the WebSocket path of that GUID.
@@ -64,6 +65,10 @@ async function fakeCdpEndpoint() {
     sockets,
     answers,
     webSocketUrl,
+    // One CDP event pushed down every open socket.
+    emitEvent(method, params = {}) {
+      for (const webSocket of sockets) webSocket.send(JSON.stringify({ method, params }));
+    },
     // One confirm() on every open socket; resolves once each has answered.
     async dialogOnEverySocket() {
       const expected = answers.length + sockets.size;
@@ -134,8 +139,8 @@ async function withFakeBrowser(run) {
   const registryRoot = await mkdtemp(path.join(tmpdir(), "omowright-shared-"));
   const fake = await fakeCdpEndpoint();
   const connections = [];
-  const connectAs = async (name) => {
-    const connection = await connectNamed(name, { registryRoot });
+  const connectAs = async (name, options = {}) => {
+    const connection = await connectNamed(name, { registryRoot, ...options });
     connections.push(connection);
     return connection;
   };
@@ -207,76 +212,122 @@ test("a different browser GUID at the same port never reuses the old connection"
   });
 });
 
-// Contract owner: a holder's settings stay with that holder (#72 review). The
-// shared connection's dialog policy, client and properties are what every other
-// holder and every later attach gets, so nothing set through one handle may
-// change them. Socket 0 is the shared connection in every row.
-const holderSettings = [
-  {
-    label: "setDialogPolicy on a handle",
-    change: (handle) => handle.setDialogPolicy({ accept: false }),
-  },
-  {
-    label: "setDialogPolicy on a handle's cdp",
-    change: (handle) => handle.cdp.setDialogPolicy({ accept: false }),
-  },
+// Contract owner: a handle never changes what another holder gets (#72 review).
+// The shared connection's dialog policy, client, properties and listeners are
+// what every other holder and every later attach sees. Socket 0 is the first
+// connection in every row; dialogs are raised on every open socket.
+const sharedPolicyPaths = [
+  { label: "the handle", set: (handle, policy) => handle.setDialogPolicy(policy) },
+  { label: "the handle's cdp", set: (handle, policy) => handle.cdp.setDialogPolicy(policy) },
 ];
+const byDialogSocket = (answers) => answers.sort((x, y) => x.socket - y.socket).map((a) => a.accept);
 const holderCases = [
-  ...holderSettings.map((setting) => ({
-    label: `${setting.label} applies to that holder only`,
+  ...sharedPolicyPaths.map((path) => ({
+    label: `setDialogPolicy through ${path.label} on a shared connection throws SharedConnectionError`,
     async run({ fake, connectAs }) {
-      const changed = await connectAs("mine");
-      await connectAs("mine");
-      setting.change(changed);
-      await changed.cdp.send("Browser.getVersion");
-      await connectAs("mine");
-      const answers = await fake.dialogOnEverySocket();
-      assert.deepEqual(answers.filter((a) => a.socket === 0), [{ socket: 0, accept: true }]);
-      assert.deepEqual(answers.filter((a) => a.socket !== 0).map((a) => a.accept), [false]);
+      const changing = await connectAs();
+      await connectAs();
+      assert.throws(() => path.set(changing, { accept: false }), (error) => {
+        assert.ok(error instanceof SharedConnectionError);
+        assert.equal(error.code, "shared_connection");
+        assert.match(error.message, /pass dialogPolicy to connect\(\)\/connectNamed\(\)/);
+        return true;
+      });
+      assert.deepEqual(byDialogSocket(await fake.dialogOnEverySocket()), [true]);
+      assert.deepEqual(fake.upgrades, ["first"]);
+    },
+  })),
+  ...sharedPolicyPaths.map((path) => ({
+    label: `a sole holder's setDialogPolicy through ${path.label} works and stops sharing`,
+    async run({ fake, connectAs }) {
+      const sole = await connectAs();
+      path.set(sole, { accept: false });
+      await connectAs();
+      assert.deepEqual(byDialogSocket(await fake.dialogOnEverySocket()), [false, true]);
+    },
+  })),
+  ...sharedPolicyPaths.map((path) => ({
+    label: `setDialogPolicy(undefined) through ${path.label} resets to accepting dialogs`,
+    async run({ fake, connectAs }) {
+      const sole = await connectAs({ dialogPolicy: { accept: false } });
+      path.set(sole, undefined);
+      assert.deepEqual(byDialogSocket(await fake.dialogOnEverySocket()), [true]);
     },
   })),
   {
-    label: "a sole holder's setDialogPolicy never reaches a later attach",
+    label: "attaches asking for different dialog policies never share",
     async run({ fake, connectAs }) {
-      const changed = await connectAs("mine");
-      changed.setDialogPolicy({ accept: false });
-      await connectAs("mine");
-      const answers = await fake.dialogOnEverySocket();
-      assert.deepEqual(
-        answers.sort((x, y) => x.socket - y.socket).map((a) => a.accept),
-        [false, true],
-      );
+      await connectAs({ dialogPolicy: { accept: false } });
+      await connectAs();
+      assert.deepEqual(fake.upgrades, ["first", "first"]);
+      assert.deepEqual(byDialogSocket(await fake.dialogOnEverySocket()), [false, true]);
     },
   },
   {
-    label: "a property written on a handle stays on that handle",
+    label: "a property set or defined on a handle stays on that handle",
     async run({ connectAs }) {
-      const writer = await connectAs("mine");
-      const other = await connectAs("mine");
-      writer.marker = "writer";
-      assert.equal(writer.marker, "writer");
+      const writer = await connectAs();
+      const other = await connectAs();
+      writer.marker = "set";
+      Object.defineProperty(writer, "defined", { value: "defined", configurable: true });
+      assert.equal(writer.marker, "set");
+      assert.equal(writer.defined, "defined");
       assert.equal(other.marker, undefined);
+      assert.equal(other.defined, undefined);
     },
   },
   {
-    label: "a handle cannot rewrite the shared client",
-    async run({ fake, connectAs }) {
-      const writer = await connectAs("mine");
-      const other = await connectAs("mine");
-      const before = other.cdp.cdpUrl;
+    label: "a handle cannot delete a shared property",
+    async run({ connectAs }) {
+      const deleting = await connectAs();
+      const other = await connectAs();
       assert.throws(() => {
-        writer.cdp.cdpUrl = "http://127.0.0.1:1";
+        delete deleting.tabs;
       }, TypeError);
-      assert.equal(other.cdp.cdpUrl, before);
+      assert.deepEqual(await other.listTargets(), []);
+    },
+  },
+  {
+    label: "a client reference taken through a handle cannot change the shared client",
+    async run({ fake, connectAs }) {
+      const client = (await connectAs()).cdp;
+      const other = await connectAs();
+      const before = other.cdp.logId;
+      assert.throws(() => {
+        client.logId = "changed";
+      }, TypeError);
+      assert.throws(() => Object.defineProperty(client, "logId", { value: "changed" }), TypeError);
+      assert.throws(() => {
+        delete client.logId;
+      }, TypeError);
+      assert.equal(other.cdp.logId, before);
       await other.cdp.send("Browser.getVersion");
       assert.deepEqual(fake.upgrades, ["first"]);
     },
   },
   {
+    label: "listeners added through a handle stop when that handle closes",
+    async run({ fake, connectAs }) {
+      const closing = await connectAs();
+      const other = await connectAs();
+      const heardByClosed = [];
+      closing.cdp.on("Target.targetCreated", () => heardByClosed.push("cdp"));
+      closing.cdp.transportEvents.on("disconnected", () => heardByClosed.push("transport"));
+      await closing.close();
+      const delivered = new Promise((resolve) => other.cdp.on("Target.targetCreated", resolve));
+      const dropped = nextTransportEvent(other, "disconnected");
+      fake.emitEvent("Target.targetCreated", { targetInfo: { targetId: "t", type: "page" } });
+      await delivered;
+      fake.dropConnections();
+      await dropped;
+      assert.deepEqual(heardByClosed, []);
+    },
+  },
+  {
     label: "cdp.close() on a handle releases only that handle",
     async run({ fake, connectAs }) {
-      const closing = await connectAs("mine");
-      const other = await connectAs("mine");
+      const closing = await connectAs();
+      const other = await connectAs();
       await closing.cdp.close();
       await other.cdp.send("Browser.getVersion");
       assert.deepEqual(fake.upgrades, ["first"]);
@@ -286,8 +337,8 @@ const holderCases = [
   {
     label: "a closed handle refuses further use",
     async run({ fake, connectAs }) {
-      const closed = await connectAs("mine");
-      await connectAs("mine");
+      const closed = await connectAs();
+      await connectAs();
       await closed.close();
       assert.throws(() => closed.listTargets(), /handle was closed/);
       assert.throws(() => closed.cdp, /handle was closed/);
@@ -298,6 +349,7 @@ const holderCases = [
 
 for (const holderCase of holderCases) {
   test(holderCase.label, async () => {
-    await withFakeBrowser(holderCase.run);
+    await withFakeBrowser(({ fake, connectAs }) =>
+      holderCase.run({ fake, connectAs: (options) => connectAs("mine", options) }));
   });
 }

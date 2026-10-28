@@ -100,15 +100,10 @@ export class BrowserConnection {
   }
 }
 
-// Not yet connected: the client connects on initialize() or its first command.
-export function createConnection(cdpHttpUrl, options = {}) {
+export async function connect(cdpHttpUrl, options = {}) {
   if (typeof cdpHttpUrl !== "string" || cdpHttpUrl.length === 0) {
     throw new TypeError("connect(cdpHttpUrl) requires a Chromium CDP HTTP URL");
   }
   const client = new CdpClient({ cdpUrl: cdpHttpUrl, ...options.client, dialogPolicy: options.dialogPolicy ?? options.client?.dialogPolicy });
-  return new BrowserConnection(client, options);
-}
-
-export async function connect(cdpHttpUrl, options = {}) {
-  return createConnection(cdpHttpUrl, options).initialize();
+  return new BrowserConnection(client, options).initialize();
 }
