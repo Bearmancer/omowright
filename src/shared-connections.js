@@ -64,11 +64,14 @@ export async function acquireSharedConnection(
     const connection = await entry.ready;
     // A dropped socket is already being reconnected by the client; join that
     // attempt (or start one) instead of opening a second connection.
-    await withinTimeout(
-      connection.cdp.ensureConnected(),
-      timeoutMs,
-      `timed out after ${timeoutMs}ms reconnecting the CDP session on ${webSocketDebuggerUrl}`,
-    );
+    const reconnected = connection.cdp.ensureConnected();
+    await (timeoutMs === undefined
+      ? reconnected
+      : withinTimeout(
+          reconnected,
+          timeoutMs,
+          `timed out after ${timeoutMs}ms reconnecting the CDP session on ${webSocketDebuggerUrl}`,
+        ));
     return lease(webSocketDebuggerUrl, entry, connection);
   } catch (error) {
     await release(webSocketDebuggerUrl, entry);
