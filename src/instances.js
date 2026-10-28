@@ -13,7 +13,11 @@ import os from "node:os";
 import path from "node:path";
 import { connect } from "./connection.js";
 import { isPidAlive, unlinkIfPresent, withLock } from "./instance-lock.js";
-import { discoverLaunchedEndpoint } from "./launch-endpoint.js";
+import {
+  assertLaunchedBrowser,
+  discoverLaunchedEndpoint,
+  snapshotActivePort,
+} from "./launch-endpoint.js";
 
 const RECORD_VERSION = 2;
 const DEFAULT_REGISTRY_ROOT = path.join(
@@ -277,6 +281,7 @@ async function launchNamed(
   const profileDir = options.profileDir
     ? path.resolve(options.profileDir)
     : profileDirFromArgs(browserArgs);
+  const previousActivePort = await snapshotActivePort(profileDir);
   const child = spawn(
     options.browserPath,
     [
@@ -293,10 +298,12 @@ async function launchNamed(
   let connection;
   try {
     const launchTimeoutMs = options.launchTimeoutMs ?? DEFAULT_LAUNCH_TIMEOUT_MS;
-    const endpoint = await discoverLaunchedEndpoint(child, {
+    const report = await discoverLaunchedEndpoint(child, {
       profileDir,
       timeoutMs: launchTimeoutMs,
+      previousActivePort,
     });
+    const { endpoint } = report;
     // The browser's own WebSocket URL carries its GUID: recording it makes a
     // later attach prove it reached this browser and not whatever else ends up
     // on the port once this pid is gone.
@@ -304,6 +311,7 @@ async function launchNamed(
       endpoint,
       launchTimeoutMs,
     );
+    assertLaunchedBrowser(child, report, webSocketDebuggerUrl);
     connection = await connectWithin(
       endpoint,
       connectionOptions(options, profileDir),
