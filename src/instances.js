@@ -18,6 +18,7 @@ import {
   discoverLaunchedEndpoint,
   snapshotActivePort,
 } from "./launch-endpoint.js";
+import { acquireSharedConnection } from "./shared-connections.js";
 
 const RECORD_VERSION = 2;
 const DEFAULT_REGISTRY_ROOT = path.join(
@@ -264,6 +265,9 @@ function connectionOptions(options, profileDir) {
       ...options.client,
     };
   }
+  // Part of the sharing key too: callers asking for different dialog policies
+  // never share one connection.
+  if (options.dialogPolicy !== undefined) result.dialogPolicy = options.dialogPolicy;
   return result;
 }
 
@@ -410,11 +414,19 @@ async function attachOrLaunch(normalizedName, paths, options) {
       if (
         version?.webSocketDebuggerUrl === loaded.record.webSocketDebuggerUrl
       ) {
+        // Connecting to the recorded GUID URL, not the port, keeps the shared
+        // connection's auto-reconnect from landing on a different browser.
+        const { webSocketDebuggerUrl } = loaded.record;
+        const timeoutMs = resolveConnectTimeoutMs(options);
         try {
-          return await connectWithin(
-            loaded.record.endpoint,
+          return await acquireSharedConnection(
+            webSocketDebuggerUrl,
             connectionOptions(options, loaded.record.profileDir),
-            resolveConnectTimeoutMs(options),
+            {
+              open: (shared) =>
+                connectWithin(webSocketDebuggerUrl, shared, timeoutMs),
+              timeoutMs,
+            },
           );
         } catch (error) {
           throw new Error(
