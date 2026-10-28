@@ -12,7 +12,7 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createConnection, openConnection } from "./connection.js";
+import { openConnection } from "./connection.js";
 import { isPidAlive, unlinkIfPresent, withLock } from "./instance-lock.js";
 import { acquireSharedConnection } from "./shared-connections.js";
 
@@ -366,6 +366,9 @@ function connectionOptions(options, profileDir) {
       ...options.client,
     };
   }
+  // Part of the sharing key too: callers asking for different dialog policies
+  // never share one connection.
+  if (options.dialogPolicy !== undefined) result.dialogPolicy = options.dialogPolicy;
   return result;
 }
 
@@ -519,7 +522,6 @@ async function attachOrLaunch(normalizedName, paths, options) {
             {
               open: (shared) =>
                 connectWithin(webSocketDebuggerUrl, shared, timeoutMs),
-              create: (own) => createConnection(webSocketDebuggerUrl, own),
               timeoutMs,
             },
           );

@@ -33,22 +33,38 @@ function bindTo(target, value) {
   return typeof value === "function" ? value.bind(target) : value;
 }
 
-// A lease is one holder's view of the shared connection. Nothing a holder sets
-// through it may change what another holder gets (#72 review):
-// - setDialogPolicy (on the lease or on lease.cdp) cannot be scoped to one
-//   holder's dialogs, because pages are shared between holders. With other
-//   holders it moves this holder to a connection of its own with that policy;
-//   as the only holder it keeps the connection, which stops being shared so no
-//   later attach gets the changed policy.
-// - Properties written on the lease stay on the lease; the shared client's
-//   properties cannot be written through it, and lease.cdp.close() releases.
+// Thrown when a holder tries to change a setting every other holder of the
+// connection shares. Opening with that setting gives the holder its own.
+export class SharedConnectionError extends Error {
+  constructor() {
+    super("this browser connection is shared; pass dialogPolicy to connect()/connectNamed() so this holder gets its own connection");
+    this.name = "SharedConnectionError";
+    this.code = "shared_connection";
+  }
+}
+
+function refuse(what) {
+  return (_target, property) => {
+    throw new TypeError(`cannot change ${String(property)} on ${what} through a handle: every holder of this connection uses it`);
+  };
+}
+
+// A lease is one holder's view of the shared connection, and a holder never
+// changes what another holder gets (#72 review):
+// - setDialogPolicy works for a sole holder and makes the connection
+//   unshareable from then on; while others hold it, it throws
+//   SharedConnectionError instead (pages are shared, so a policy can't be
+//   scoped to one holder, and moving the holder would orphan its pages).
+// - Properties set or defined on the lease stay on the lease; shared ones can't
+//   be deleted through it, and the shared client can't be written through it.
+// - Listeners added through lease.cdp are removed when the lease closes, and
+//   lease.cdp.close() releases only this lease.
 // - After close() the lease refuses every use, so a stale handle can never
 //   reopen a connection nobody owns.
-function lease(key, entry, connection, create) {
-  let current = connection;
-  let detached = false;
+function lease(key, entry, connection) {
   let closed;
-  const own = new Map();
+  const overlay = Object.create(null);
+  const subscriptions = [];
   // Symbols and `then` stay readable, so inspecting or resolving a closed
   // handle doesn't throw; every named member does.
   const ensureOpen = (property) => {
@@ -57,60 +73,69 @@ function lease(key, entry, connection, create) {
     }
   };
   const close = () => {
-    closed ??= detached ? current.close() : release(key, entry);
+    if (!closed) {
+      for (const unsubscribe of subscriptions.splice(0)) unsubscribe();
+      closed = release(key, entry);
+    }
     return closed;
   };
   const setDialogPolicy = (policy) => {
     ensureOpen("setDialogPolicy");
-    if (detached) return current.setDialogPolicy(policy);
-    if (entry.refs > 1) {
-      const mine = create({ ...entry.options, dialogPolicy: policy });
-      mine.initialize().catch(() => {});
-      void release(key, entry);
-      current = mine;
-      detached = true;
-      return undefined;
-    }
+    if (entry.refs > 1) throw new SharedConnectionError();
     if (shared.get(key) === entry) shared.delete(key);
-    return current.setDialogPolicy(policy);
+    return connection.setDialogPolicy(policy);
   };
-  let view;
-  let viewOf;
-  const clientView = () => {
-    const client = current.cdp;
-    if (viewOf !== client) {
-      viewOf = client;
-      view = new Proxy(client, {
-        get(target, property) {
-          ensureOpen(property);
-          if (property === "setDialogPolicy") return setDialogPolicy;
-          if (property === "close") return close;
-          return bindTo(target, Reflect.get(target, property, target));
-        },
-        set(target, property, value) {
-          ensureOpen(property);
-          if (!detached) {
-            throw new TypeError(`cannot set ${String(property)} on a shared CDP client: every holder of this connection uses it`);
-          }
-          return Reflect.set(target, property, value, target);
-        },
-      });
-    }
-    return view;
+  const tracked = (subscribe) => (...args) => {
+    const unsubscribe = subscribe(...args);
+    subscriptions.push(unsubscribe);
+    return unsubscribe;
   };
+  const readOnly = (what, get) => ({
+    get,
+    set: refuse(what),
+    defineProperty: refuse(what),
+    deleteProperty: refuse(what),
+  });
+  const client = connection.cdp;
+  const transportEvents = new Proxy(client.transportEvents, readOnly("the shared transport events", (target, property) => {
+    ensureOpen(property);
+    if (property === "on") return tracked(target.on.bind(target));
+    return bindTo(target, Reflect.get(target, property, target));
+  }));
+  const clientView = new Proxy(client, readOnly("the shared CDP client", (target, property) => {
+    ensureOpen(property);
+    if (property === "setDialogPolicy") return setDialogPolicy;
+    if (property === "close") return close;
+    if (property === "on") return tracked(target.on.bind(target));
+    if (property === "transportEvents") return transportEvents;
+    return bindTo(target, Reflect.get(target, property, target));
+  }));
   return new Proxy(connection, {
-    get(_target, property) {
+    get(target, property) {
       if (property === "close") return close;
       ensureOpen(property);
       if (property === "setDialogPolicy") return setDialogPolicy;
-      if (property === "cdp") return clientView();
-      if (own.has(property)) return own.get(property);
-      return bindTo(current, Reflect.get(current, property, current));
+      if (property === "cdp") return clientView;
+      if (Object.hasOwn(overlay, property)) return overlay[property];
+      return bindTo(target, Reflect.get(target, property, target));
     },
     set(_target, property, value) {
       ensureOpen(property);
-      own.set(property, value);
-      return true;
+      return Reflect.set(overlay, property, value);
+    },
+    defineProperty(_target, property, descriptor) {
+      ensureOpen(property);
+      // A non-configurable property can't live on the lease alone.
+      if (descriptor.configurable !== true) return false;
+      return Reflect.defineProperty(overlay, property, descriptor);
+    },
+    deleteProperty(target, property) {
+      ensureOpen(property);
+      if (Object.hasOwn(overlay, property)) return Reflect.deleteProperty(overlay, property);
+      return refuse("the shared connection")(target, property);
+    },
+    has(target, property) {
+      return Object.hasOwn(overlay, property) || Reflect.has(target, property);
     },
   });
 }
@@ -151,14 +176,13 @@ export function canShareConnection(options) {
 }
 
 // `open(options)` makes the real connection; it runs once per browser while a
-// lease is held. `create(options)` returns one not yet connected, for a holder
-// that leaves the shared connection. A caller whose connection options differ
-// from the shared connection's gets a connection of its own rather than
-// someone else's storage root or dialog policy.
+// lease is held. A caller whose connection options differ from the shared
+// connection's (dialogPolicy included) gets a connection of its own rather
+// than someone else's storage root or dialog policy.
 export async function acquireSharedConnection(
   webSocketDebuggerUrl,
   options,
-  { open, create, timeoutMs },
+  { open, timeoutMs },
 ) {
   if (!canShareConnection(options)) return open(options);
   let entry = shared.get(webSocketDebuggerUrl);
@@ -180,7 +204,7 @@ export async function acquireSharedConnection(
           timeoutMs,
           `timed out after ${timeoutMs}ms reconnecting the CDP session on ${webSocketDebuggerUrl}`,
         ));
-    return lease(webSocketDebuggerUrl, entry, connection, create);
+    return lease(webSocketDebuggerUrl, entry, connection);
   } catch (error) {
     // The browser behind this key is gone or unreachable: evict the entry so
     // the next attach resolves and opens anew instead of joining a dead one.

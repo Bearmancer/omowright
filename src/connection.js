@@ -117,15 +117,10 @@ function createClient(cdpHttpUrl, options) {
   return new CdpClient({ cdpUrl: cdpHttpUrl, ...options.client, dialogPolicy: options.dialogPolicy ?? options.client?.dialogPolicy });
 }
 
-// Not yet connected: the client connects on initialize() or its first command.
-export function createConnection(cdpHttpUrl, options = {}) {
-  return new BrowserConnection(createClient(cdpHttpUrl, options), options);
-}
-
 // A connection of its own, never shared: for callers that lease or own the
 // connection themselves (the named-instance registry).
 export async function openConnection(cdpHttpUrl, options = {}) {
-  return createConnection(cdpHttpUrl, options).initialize();
+  return new BrowserConnection(createClient(cdpHttpUrl, options), options).initialize();
 }
 
 export async function connect(cdpHttpUrl, options = {}) {
@@ -136,6 +131,5 @@ export async function connect(cdpHttpUrl, options = {}) {
   // only this browser, and fails once it is gone (#79 review).
   return acquireSharedConnection(key, options, {
     open: () => openConnection(key, options),
-    create: (own) => createConnection(key, own),
   });
 }
