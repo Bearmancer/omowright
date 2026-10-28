@@ -14,6 +14,7 @@ import os from "node:os";
 import path from "node:path";
 import { connect } from "./connection.js";
 import { isPidAlive, unlinkIfPresent, withLock } from "./instance-lock.js";
+import { acquireSharedConnection } from "./shared-connections.js";
 
 const RECORD_VERSION = 2;
 const DEFAULT_REGISTRY_ROOT = path.join(
@@ -507,11 +508,19 @@ async function attachOrLaunch(normalizedName, paths, options) {
       if (
         version?.webSocketDebuggerUrl === loaded.record.webSocketDebuggerUrl
       ) {
+        // Connecting to the recorded GUID URL, not the port, keeps the shared
+        // connection's auto-reconnect from landing on a different browser.
+        const { webSocketDebuggerUrl } = loaded.record;
+        const timeoutMs = resolveConnectTimeoutMs(options);
         try {
-          return await connectWithin(
-            loaded.record.endpoint,
+          return await acquireSharedConnection(
+            webSocketDebuggerUrl,
             connectionOptions(options, loaded.record.profileDir),
-            resolveConnectTimeoutMs(options),
+            {
+              open: (shared) =>
+                connectWithin(webSocketDebuggerUrl, shared, timeoutMs),
+              timeoutMs,
+            },
           );
         } catch (error) {
           throw new Error(

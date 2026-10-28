@@ -90,6 +90,12 @@ loop; the module files next to it are implementation detail.
   without `name`) expose no port at all.
   `newTab()` works on both paths; `close()` from the launcher terminates the
   browser and removes its record, from an attached client it only detaches.
+  Attaches in one process share one CDP connection per browser, because
+  Chrome asks the user to allow remote debugging once per connection: each
+  attach returns a handle on it, `close()` releases that handle, and the last
+  release disconnects. A dropped socket is reconnected once, and a browser
+  with another GUID always gets its own connection. Callers passing different
+  connection options (storage root, client options) are not shared.
   `listInstances()` returns every record (`{ name, pid, endpoint,
   webSocketDebuggerUrl, profileDir, browserPath, startedAt }`) with `alive` /
   `responsive` liveness.
