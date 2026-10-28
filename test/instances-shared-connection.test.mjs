@@ -386,3 +386,39 @@ for (const attachPath of attachPaths) {
     });
   }
 }
+
+// Options are shared only when equality can see all of them (#79 review): a
+// cycle must not throw, and a symbol or non-enumerable key, or an accessor, can
+// hide a difference (a non-enumerable dialogPolicy is still read when the
+// connection is made), so each of these gets a connection of its own.
+const unshareableOptions = [
+  {
+    label: "cyclic options",
+    make: () => {
+      const options = { client: {} };
+      options.client.owner = options;
+      return options;
+    },
+  },
+  {
+    label: "a non-enumerable dialogPolicy",
+    make: () => Object.defineProperty({}, "dialogPolicy", { value: { accept: false }, enumerable: false }),
+  },
+  { label: "a symbol key", make: () => ({ [Symbol.for("omowright.test")]: true }) },
+  { label: "an accessor", make: () => ({ get storageRoot() { return "."; } }) },
+];
+for (const unshareable of unshareableOptions) {
+  test(`connect(url) with ${unshareable.label} gets a connection of its own`, async () => {
+    await withFakeBrowser(attachPaths[1], async ({ fake }) => {
+      const handles = [];
+      try {
+        handles.push(await connect(fake.endpoint, unshareable.make()));
+        handles.push(await connect(fake.endpoint, unshareable.make()));
+        assert.notEqual(handles[0].cdp, handles[1].cdp);
+        assert.deepEqual(fake.upgrades, ["first", "first"]);
+      } finally {
+        await Promise.all(handles.map((h) => h.close().catch(() => {})));
+      }
+    });
+  });
+}

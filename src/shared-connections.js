@@ -115,17 +115,33 @@ function lease(key, entry, connection, create) {
   });
 }
 
-// Only plain data is compared structurally. A class instance (an authorizer
-// holding its token in a private field, say) compares equal to another one
-// with different hidden state, so such options are never shared; functions
-// compare by identity, which is exact.
-function isPlainData(value) {
-  if (typeof value === "function") return true;
-  if (value === null || typeof value !== "object") return true;
-  if (Array.isArray(value)) return value.every(isPlainData);
+// Only plain data is compared structurally, and isDeepStrictEqual sees only
+// enumerable values. So options are shared only when every own key is an
+// enumerable, string-keyed data property and nothing refers back to itself;
+// a class instance (an authorizer keeping its token in a private field), a
+// symbol or non-enumerable key, an accessor or a cycle makes them unshareable.
+// Functions compare by identity, which is exact.
+function isPlainData(value, path = new Set()) {
+  if (typeof value === "function" || value === null || typeof value !== "object") return true;
+  if (path.has(value)) return false;
   const prototype = Object.getPrototypeOf(value);
-  if (prototype !== Object.prototype && prototype !== null) return false;
-  return Object.values(value).every(isPlainData);
+  const isArray = Array.isArray(value);
+  if (isArray ? prototype !== Array.prototype : prototype !== Object.prototype && prototype !== null) {
+    return false;
+  }
+  path.add(value);
+  try {
+    for (const key of Reflect.ownKeys(value)) {
+      if (isArray && key === "length") continue;
+      if (typeof key === "symbol") return false;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor.enumerable || !("value" in descriptor)) return false;
+      if (!isPlainData(descriptor.value, path)) return false;
+    }
+    return true;
+  } finally {
+    path.delete(value);
+  }
 }
 
 // An authorizer is a credential: two callers never share one connection
