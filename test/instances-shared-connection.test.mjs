@@ -1,4 +1,5 @@
-// Contract owner: one approved CDP connection per browser per process (#68).
+// Contract owner: one approved CDP connection per browser per process, for both
+// attach paths: connectNamed (#68) and connect(url) (#76).
 // Chrome asks the user to allow remote debugging once per WebSocket connection
 // to their own profile, so every extra upgrade is an extra prompt. The fake
 // endpoint below counts upgrades at the real HTTP/WebSocket attach boundary.
@@ -10,6 +11,7 @@ import path from "node:path";
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { WebSocketServer } from "ws";
+import { connect } from "../src/connection.js";
 import { connectNamed } from "../src/instances.js";
 import * as sharedConnections from "../src/shared-connections.js";
 
@@ -18,6 +20,7 @@ import * as sharedConnections from "../src/shared-connections.js";
 async function fakeCdpEndpoint() {
   let guid = "first";
   const upgrades = [];
+  const authorizations = [];
   const sockets = new Set();
   // Each socket's id is its upgrade order; answers records how every socket
   // answered the dialogs emitDialog() raised on it.
@@ -41,6 +44,7 @@ async function fakeCdpEndpoint() {
     webSockets.handleUpgrade(request, socket, head, (webSocket) => {
       socketIds.set(webSocket, upgrades.length);
       upgrades.push(guid);
+      authorizations.push(request.headers.authorization ?? null);
       sockets.add(webSocket);
       webSocket.on("close", () => sockets.delete(webSocket));
       webSocket.on("message", (data) => {
@@ -62,6 +66,7 @@ async function fakeCdpEndpoint() {
   return {
     endpoint,
     upgrades,
+    authorizations,
     sockets,
     answers,
     webSocketUrl,
@@ -135,18 +140,35 @@ function nextTransportEvent(connection, name) {
   });
 }
 
-async function withFakeBrowser(run) {
+// Both attach paths run every case below. A named attach finds the browser
+// through its registry record (re-registered when the browser changes); a URL
+// attach finds it through the endpoint's /json/version.
+const attachPaths = [
+  {
+    label: "connectNamed",
+    attach: ({ registryRoot }, options = {}) => connectNamed("mine", { registryRoot, ...options }),
+    browserChanged: ({ registryRoot, fake }) => register(registryRoot, "mine", fake),
+  },
+  {
+    label: "connect(url)",
+    attach: ({ fake }, options) => connect(fake.endpoint, options),
+    browserChanged: async () => {},
+  },
+];
+
+async function withFakeBrowser(attachPath, run) {
   const registryRoot = await mkdtemp(path.join(tmpdir(), "omowright-shared-"));
   const fake = await fakeCdpEndpoint();
   const connections = [];
-  const connectAs = async (name, options = {}) => {
-    const connection = await connectNamed(name, { registryRoot, ...options });
+  const context = { fake, registryRoot };
+  const attach = async (options) => {
+    const connection = await attachPath.attach(context, options);
     connections.push(connection);
     return connection;
   };
   try {
     await register(registryRoot, "mine", fake);
-    await run({ fake, registryRoot, connectAs });
+    await run({ ...context, attach, browserChanged: () => attachPath.browserChanged(context) });
   } finally {
     await Promise.all(connections.map((c) => c.close().catch(() => {})));
     await fake.close();
@@ -154,61 +176,121 @@ async function withFakeBrowser(run) {
   }
 }
 
-test("repeated connectNamed calls reuse one connection until the last close", async () => {
-  await withFakeBrowser(async ({ fake, connectAs }) => {
-    const first = await connectAs("mine");
-    const second = await connectAs("mine");
-    const third = await connectAs("mine");
-    assert.deepEqual(fake.upgrades, ["first"]);
+for (const attachPath of attachPaths) {
+  test(`repeated ${attachPath.label} calls reuse one connection until the last close`, async () => {
+    await withFakeBrowser(attachPath, async ({ fake, attach }) => {
+      const first = await attach();
+      const second = await attach();
+      const third = await attach();
+      assert.deepEqual(fake.upgrades, ["first"]);
 
-    // A caller's close releases its handle; the others keep the connection.
-    await first.close();
-    await second.close();
-    await third.cdp.send("Browser.getVersion");
-    assert.equal(fake.sockets.size, 1);
+      // A caller's close releases its handle; the others keep the connection.
+      await first.close();
+      await second.close();
+      await third.cdp.send("Browser.getVersion");
+      assert.equal(fake.sockets.size, 1);
 
-    // The last release disconnects, so a script that closes can still exit.
-    const [socket] = fake.sockets;
-    const closed = once(socket, "close");
-    await third.close();
-    await closed;
-    assert.deepEqual(fake.upgrades, ["first"]);
+      // The last release disconnects, so a script that closes can still exit.
+      const [socket] = fake.sockets;
+      const closed = once(socket, "close");
+      await third.close();
+      await closed;
+      assert.deepEqual(fake.upgrades, ["first"]);
+    });
+  });
+
+  test(`concurrent first ${attachPath.label} calls share one upgrade`, async () => {
+    await withFakeBrowser(attachPath, async ({ fake, attach }) => {
+      await Promise.all([attach(), attach(), attach()]);
+      assert.deepEqual(fake.upgrades, ["first"]);
+    });
+  });
+
+  test(`a dropped ${attachPath.label} connection is replaced by exactly one new upgrade`, async () => {
+    await withFakeBrowser(attachPath, async ({ fake, attach }) => {
+      const first = await attach();
+      const dropped = nextTransportEvent(first, "disconnected");
+      const restored = nextTransportEvent(first, "reconnected");
+      fake.dropConnections();
+      await dropped;
+
+      const next = await attach();
+      await restored;
+      await next.cdp.send("Browser.getVersion");
+      await first.cdp.send("Browser.getVersion");
+      assert.deepEqual(fake.upgrades, ["first", "first"]);
+    });
+  });
+
+  test(`${attachPath.label} never reuses a connection for a different browser GUID at the same port`, async () => {
+    await withFakeBrowser(attachPath, async ({ fake, attach, browserChanged }) => {
+      const old = await attach();
+      fake.becomeBrowser("second");
+      await browserChanged();
+
+      const fresh = await attach();
+      assert.notEqual(fresh.cdp, old.cdp);
+      await fresh.cdp.send("Browser.getVersion");
+      assert.deepEqual(fake.upgrades, ["first", "second"]);
+    });
+  });
+}
+
+// connect(url) leases are keyed by the browser GUID, so the connection behind a
+// key must never end up serving another browser (#79 review). Short reconnect
+// delays keep the doomed reconnects to the vanished GUID quick.
+test("connect(url) never leases a connection that would serve a different browser", async () => {
+  await withFakeBrowser(attachPaths[1], async ({ fake }) => {
+    const options = { client: { reconnectDelaysMs: [0, 50] } };
+    const oldUrl = fake.webSocketUrl();
+    const first = await connect(fake.endpoint, options);
+    let stale;
+    let fresh;
+    try {
+      const dropped = nextTransportEvent(first, "disconnected");
+      fake.becomeBrowser("second");
+      fake.dropConnections();
+      await dropped;
+
+      const error = await connect(oldUrl, options).then((attached) => {
+        stale = attached;
+        return null;
+      }, (rejection) => rejection);
+      assert.ok(error instanceof Error, "an attach to the vanished browser must fail, not lease");
+      assert.deepEqual(fake.upgrades, ["first"]);
+
+      // The failed entry is evicted, so the endpoint resolves anew.
+      fresh = await connect(fake.endpoint, options);
+      await fresh.cdp.send("Browser.getVersion");
+      assert.deepEqual(fake.upgrades, ["first", "second"]);
+    } finally {
+      await Promise.all([first, stale, fresh].map((c) => c?.close().catch(() => {})));
+    }
   });
 });
 
-test("concurrent first connectNamed calls share one upgrade", async () => {
-  await withFakeBrowser(async ({ fake, connectAs }) => {
-    await Promise.all([connectAs("mine"), connectAs("mine"), connectAs("mine")]);
-    assert.deepEqual(fake.upgrades, ["first"]);
-  });
-});
-
-test("a dropped connection is replaced by exactly one new upgrade", async () => {
-  await withFakeBrowser(async ({ fake, connectAs }) => {
-    const first = await connectAs("mine");
-    const dropped = nextTransportEvent(first, "disconnected");
-    const restored = nextTransportEvent(first, "reconnected");
-    fake.dropConnections();
-    await dropped;
-
-    const next = await connectAs("mine");
-    await restored;
-    await next.cdp.send("Browser.getVersion");
-    await first.cdp.send("Browser.getVersion");
-    assert.deepEqual(fake.upgrades, ["first", "first"]);
-  });
-});
-
-test("a different browser GUID at the same port never reuses the old connection", async () => {
-  await withFakeBrowser(async ({ fake, registryRoot, connectAs }) => {
-    const old = await connectAs("mine");
-    fake.becomeBrowser("second");
-    await register(registryRoot, "mine", fake);
-
-    const fresh = await connectAs("mine");
-    assert.notEqual(fresh.cdp, old.cdp);
-    await fresh.cdp.send("Browser.getVersion");
-    assert.deepEqual(fake.upgrades, ["first", "second"]);
+// Security contract (#79 review): an authorizer is a credential, and two of them
+// can hide different tokens behind equal-looking objects. Each caller gets its
+// own connection, authorized with its own token.
+test("connect(url) never shares one connection across two authorizers", async () => {
+  class TokenAuthorizer {
+    #token;
+    constructor(token) {
+      this.#token = token;
+    }
+    async resolveAuthorization() {
+      return `Bearer ${this.#token}`;
+    }
+  }
+  await withFakeBrowser(attachPaths[1], async ({ fake }) => {
+    const a = await connect(fake.endpoint, { client: { authorizer: new TokenAuthorizer("thread-a") } });
+    const b = await connect(fake.endpoint, { client: { authorizer: new TokenAuthorizer("thread-b") } });
+    try {
+      assert.notEqual(a.cdp, b.cdp);
+      assert.deepEqual(fake.authorizations, ["Bearer thread-a", "Bearer thread-b"]);
+    } finally {
+      await Promise.all([a, b].map((c) => c.close().catch(() => {})));
+    }
   });
 });
 
@@ -398,9 +480,47 @@ const holderCases = [
   },
 ];
 
-for (const holderCase of holderCases) {
-  test(holderCase.label, async () => {
-    await withFakeBrowser(({ fake, connectAs }) =>
-      holderCase.run({ fake, connectAs: (options) => connectAs("mine", options) }));
+for (const attachPath of attachPaths) {
+  for (const holderCase of holderCases) {
+    test(`${attachPath.label}: ${holderCase.label}`, async () => {
+      await withFakeBrowser(attachPath, ({ fake, attach }) =>
+        holderCase.run({ fake, connectAs: (options) => attach(options) }));
+    });
+  }
+}
+
+// Options are shared only when equality can see all of them (#79 review): a
+// cycle must not throw, and a symbol or non-enumerable key, or an accessor, can
+// hide a difference (a non-enumerable dialogPolicy is still read when the
+// connection is made), so each of these gets a connection of its own.
+const unshareableOptions = [
+  {
+    label: "cyclic options",
+    make: () => {
+      const options = { client: {} };
+      options.client.owner = options;
+      return options;
+    },
+  },
+  {
+    label: "a non-enumerable dialogPolicy",
+    make: () => Object.defineProperty({}, "dialogPolicy", { value: { accept: false }, enumerable: false }),
+  },
+  { label: "a symbol key", make: () => ({ [Symbol.for("omowright.test")]: true }) },
+  { label: "an accessor", make: () => ({ get storageRoot() { return "."; } }) },
+];
+for (const unshareable of unshareableOptions) {
+  test(`connect(url) with ${unshareable.label} gets a connection of its own`, async () => {
+    await withFakeBrowser(attachPaths[1], async ({ fake }) => {
+      const handles = [];
+      try {
+        handles.push(await connect(fake.endpoint, unshareable.make()));
+        handles.push(await connect(fake.endpoint, unshareable.make()));
+        assert.notEqual(handles[0].cdp, handles[1].cdp);
+        assert.deepEqual(fake.upgrades, ["first", "first"]);
+      } finally {
+        await Promise.all(handles.map((h) => h.close().catch(() => {})));
+      }
+    });
   });
 }

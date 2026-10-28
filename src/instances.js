@@ -11,7 +11,7 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { connect } from "./connection.js";
+import { openConnection } from "./connection.js";
 import { isPidAlive, unlinkIfPresent, withLock } from "./instance-lock.js";
 import {
   assertLaunchedBrowser,
@@ -187,7 +187,7 @@ function nameLockOptions(options) {
 // `/json/version` answering proves nothing about the WebSocket upgrade behind
 // it, so the session handshake carries its own bound.
 async function connectWithin(endpoint, options, timeoutMs) {
-  const pending = connect(endpoint, options);
+  const pending = openConnection(endpoint, options);
   let timer;
   try {
     return await Promise.race([

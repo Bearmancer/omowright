@@ -172,6 +172,41 @@ function lease(key, entry, connection) {
   });
 }
 
+// Only plain data is compared structurally, and isDeepStrictEqual sees only
+// enumerable values. So options are shared only when every own key is an
+// enumerable, string-keyed data property and nothing refers back to itself;
+// a class instance (an authorizer keeping its token in a private field), a
+// symbol or non-enumerable key, an accessor or a cycle makes them unshareable.
+// Functions compare by identity, which is exact.
+function isPlainData(value, path = new Set()) {
+  if (typeof value === "function" || value === null || typeof value !== "object") return true;
+  if (path.has(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  const isArray = Array.isArray(value);
+  if (isArray ? prototype !== Array.prototype : prototype !== Object.prototype && prototype !== null) {
+    return false;
+  }
+  path.add(value);
+  try {
+    for (const key of Reflect.ownKeys(value)) {
+      if (isArray && key === "length") continue;
+      if (typeof key === "symbol") return false;
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (!descriptor.enumerable || !("value" in descriptor)) return false;
+      if (!isPlainData(descriptor.value, path)) return false;
+    }
+    return true;
+  } finally {
+    path.delete(value);
+  }
+}
+
+// An authorizer is a credential: two callers never share one connection
+// through it, even with the same authorizer object (#79 review).
+export function canShareConnection(options) {
+  return options?.client?.authorizer === undefined && isPlainData(options);
+}
+
 // `open(options)` makes the real connection; it runs once per browser while a
 // lease is held. A caller whose connection options differ from the shared
 // connection's (dialogPolicy included) gets a connection of its own rather
@@ -181,6 +216,7 @@ export async function acquireSharedConnection(
   options,
   { open, timeoutMs },
 ) {
+  if (!canShareConnection(options)) return open(options);
   let entry = shared.get(webSocketDebuggerUrl);
   if (entry && !isDeepStrictEqual(entry.options, options)) return open(options);
   if (!entry) {
@@ -192,13 +228,19 @@ export async function acquireSharedConnection(
     const connection = await entry.ready;
     // A dropped socket is already being reconnected by the client; join that
     // attempt (or start one) instead of opening a second connection.
-    await withinTimeout(
-      connection.cdp.ensureConnected(),
-      timeoutMs,
-      `timed out after ${timeoutMs}ms reconnecting the CDP session on ${webSocketDebuggerUrl}`,
-    );
+    const reconnected = connection.cdp.ensureConnected();
+    await (timeoutMs === undefined
+      ? reconnected
+      : withinTimeout(
+          reconnected,
+          timeoutMs,
+          `timed out after ${timeoutMs}ms reconnecting the CDP session on ${webSocketDebuggerUrl}`,
+        ));
     return lease(webSocketDebuggerUrl, entry, connection);
   } catch (error) {
+    // The browser behind this key is gone or unreachable: evict the entry so
+    // the next attach resolves and opens anew instead of joining a dead one.
+    if (shared.get(webSocketDebuggerUrl) === entry) shared.delete(webSocketDebuggerUrl);
     await release(webSocketDebuggerUrl, entry);
     throw error;
   }
