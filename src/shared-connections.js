@@ -29,17 +29,88 @@ function release(key, entry) {
   );
 }
 
-function lease(key, entry, connection) {
-  let released;
+function bindTo(target, value) {
+  return typeof value === "function" ? value.bind(target) : value;
+}
+
+// A lease is one holder's view of the shared connection. Nothing a holder sets
+// through it may change what another holder gets (#72 review):
+// - setDialogPolicy (on the lease or on lease.cdp) cannot be scoped to one
+//   holder's dialogs, because pages are shared between holders. With other
+//   holders it moves this holder to a connection of its own with that policy;
+//   as the only holder it keeps the connection, which stops being shared so no
+//   later attach gets the changed policy.
+// - Properties written on the lease stay on the lease; the shared client's
+//   properties cannot be written through it, and lease.cdp.close() releases.
+// - After close() the lease refuses every use, so a stale handle can never
+//   reopen a connection nobody owns.
+function lease(key, entry, connection, create) {
+  let current = connection;
+  let detached = false;
+  let closed;
+  const own = new Map();
+  // Symbols and `then` stay readable, so inspecting or resolving a closed
+  // handle doesn't throw; every named member does.
+  const ensureOpen = (property) => {
+    if (closed && typeof property === "string" && property !== "then") {
+      throw new Error("this browser connection handle was closed");
+    }
+  };
   const close = () => {
-    released ??= release(key, entry);
-    return released;
+    closed ??= detached ? current.close() : release(key, entry);
+    return closed;
+  };
+  const setDialogPolicy = (policy) => {
+    ensureOpen("setDialogPolicy");
+    if (detached) return current.setDialogPolicy(policy);
+    if (entry.refs > 1) {
+      const mine = create({ ...entry.options, dialogPolicy: policy });
+      mine.initialize().catch(() => {});
+      void release(key, entry);
+      current = mine;
+      detached = true;
+      return undefined;
+    }
+    if (shared.get(key) === entry) shared.delete(key);
+    return current.setDialogPolicy(policy);
+  };
+  let view;
+  let viewOf;
+  const clientView = () => {
+    const client = current.cdp;
+    if (viewOf !== client) {
+      viewOf = client;
+      view = new Proxy(client, {
+        get(target, property) {
+          ensureOpen(property);
+          if (property === "setDialogPolicy") return setDialogPolicy;
+          if (property === "close") return close;
+          return bindTo(target, Reflect.get(target, property, target));
+        },
+        set(target, property, value) {
+          ensureOpen(property);
+          if (!detached) {
+            throw new TypeError(`cannot set ${String(property)} on a shared CDP client: every holder of this connection uses it`);
+          }
+          return Reflect.set(target, property, value, target);
+        },
+      });
+    }
+    return view;
   };
   return new Proxy(connection, {
-    get(target, property) {
+    get(_target, property) {
       if (property === "close") return close;
-      const value = Reflect.get(target, property, target);
-      return typeof value === "function" ? value.bind(target) : value;
+      ensureOpen(property);
+      if (property === "setDialogPolicy") return setDialogPolicy;
+      if (property === "cdp") return clientView();
+      if (own.has(property)) return own.get(property);
+      return bindTo(current, Reflect.get(current, property, current));
+    },
+    set(_target, property, value) {
+      ensureOpen(property);
+      own.set(property, value);
+      return true;
     },
   });
 }
@@ -64,13 +135,14 @@ export function canShareConnection(options) {
 }
 
 // `open(options)` makes the real connection; it runs once per browser while a
-// lease is held. A caller whose connection options differ from the shared
-// connection's gets a connection of its own rather than someone else's
-// storage root or dialog policy.
+// lease is held. `create(options)` returns one not yet connected, for a holder
+// that leaves the shared connection. A caller whose connection options differ
+// from the shared connection's gets a connection of its own rather than
+// someone else's storage root or dialog policy.
 export async function acquireSharedConnection(
   webSocketDebuggerUrl,
   options,
-  { open, timeoutMs },
+  { open, create, timeoutMs },
 ) {
   if (!canShareConnection(options)) return open(options);
   let entry = shared.get(webSocketDebuggerUrl);
@@ -92,7 +164,7 @@ export async function acquireSharedConnection(
           timeoutMs,
           `timed out after ${timeoutMs}ms reconnecting the CDP session on ${webSocketDebuggerUrl}`,
         ));
-    return lease(webSocketDebuggerUrl, entry, connection);
+    return lease(webSocketDebuggerUrl, entry, connection, create);
   } catch (error) {
     // The browser behind this key is gone or unreachable: evict the entry so
     // the next attach resolves and opens anew instead of joining a dead one.
