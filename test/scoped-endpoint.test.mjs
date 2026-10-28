@@ -11,7 +11,7 @@ import { mkdtempSync, rmSync, existsSync, globSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { WebSocket, WebSocketServer } from "ws";
-import { OMOWRIGHT_PAGE_CDP_METHODS, compactSnapshot, connect, createAgentTabs } from "../src/index.js";
+import { CdpClient, OMOWRIGHT_PAGE_CDP_METHODS, compactSnapshot, connect, createAgentTabs } from "../src/index.js";
 
 function findHeadlessShell() {
   const candidates = globSync(
@@ -155,3 +155,40 @@ test("the page API runs through an endpoint that allows only OMOWRIGHT_PAGE_CDP_
   }
 });
 
+
+// Security contract (#75): a CdpClient has no default endpoint. 127.0.0.1:9222 is where a user's own Chrome listens
+// once remote debugging is enabled from chrome://inspect, so a missing URL must refuse, never dial a browser there.
+// fetch and WebSocket are intercepted at the global boundary the client dials through; nothing reaches the network.
+// The 15 s budget only matters on a regression: an unrefused client walks its full reconnect schedule (~5.5 s).
+test("a CdpClient without a URL refuses and dials nothing", { timeout: 15_000 }, async () => {
+  const dialed = [];
+  const realFetch = globalThis.fetch;
+  const RealWebSocket = globalThis.WebSocket;
+  globalThis.fetch = async (url) => {
+    dialed.push(String(url));
+    throw new Error("network blocked by test");
+  };
+  globalThis.WebSocket = class {
+    constructor(url) {
+      dialed.push(String(url));
+      throw new Error("network blocked by test");
+    }
+  };
+  const outcomes = [];
+  try {
+    for (const options of [undefined, { reconnectDelaysMs: [0] }, { cdpUrl: "", reconnectDelaysMs: [0] }]) {
+      try {
+        const client = new CdpClient(options);
+        await client.ensureConnected().catch(() => {});
+        await client.close();
+        outcomes.push("constructed");
+      } catch (error) {
+        outcomes.push(error instanceof TypeError && /requires a cdpUrl/.test(error.message) ? "refused" : String(error));
+      }
+    }
+  } finally {
+    globalThis.fetch = realFetch;
+    globalThis.WebSocket = RealWebSocket;
+  }
+  assert.deepEqual({ outcomes, dialed }, { outcomes: ["refused", "refused", "refused"], dialed: [] });
+});
