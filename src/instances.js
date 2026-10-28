@@ -12,7 +12,7 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { connect } from "./connection.js";
+import { connect, createConnection } from "./connection.js";
 import { isPidAlive, unlinkIfPresent, withLock } from "./instance-lock.js";
 import { acquireSharedConnection } from "./shared-connections.js";
 
@@ -519,6 +519,7 @@ async function attachOrLaunch(normalizedName, paths, options) {
             {
               open: (shared) =>
                 connectWithin(webSocketDebuggerUrl, shared, timeoutMs),
+              create: (own) => createConnection(webSocketDebuggerUrl, own),
               timeoutMs,
             },
           );
