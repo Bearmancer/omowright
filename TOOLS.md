@@ -98,8 +98,8 @@ loop; the module files next to it are implementation detail.
   with another GUID always gets its own connection. Callers passing different
   connection options (storage root, client options, `dialogPolicy`) are not
   shared. A holder never changes what another holder gets: on a shared handle
-  `setDialogPolicy` throws `SharedConnectionError` (pass `dialogPolicy` when
-  attaching instead), a sole holder's `setDialogPolicy` works and that
+  `setDialogPolicy` throws `SharedConnectionError` (`error.code ===
+  "shared_connection"`; pass `dialogPolicy` when attaching instead), a sole holder's `setDialogPolicy` works and that
   connection is never shared again, properties set on a handle stay on it,
   the shared client can't be written through it, and listeners added through
   `handle.cdp` are removed by that handle's `close()`. `setDialogPolicy(undefined)`
