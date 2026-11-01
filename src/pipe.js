@@ -1,4 +1,12 @@
 import { spawn } from "node:child_process";
+import {
+  browserSpawnDetached,
+  profileDirFromArgs,
+  reapOrphanedBrowser,
+  removeBrowserPidFile,
+  terminateChild,
+  writeBrowserPidFile,
+} from "./browser-process.js";
 import { BrowserConnection } from "./connection.js";
 import { normalizeDialogPolicy, resolveDialogAction } from "./dialog-policy.js";
 import { targetCreationCapability } from "./internal-capability.js";
@@ -71,10 +79,15 @@ export class PipeCdpClient {
     // onto the caller's tty (it corrupted the senpi TUI). Pipe + drain into a
     // bounded tail kept for launch diagnostics.
     const stdio = ["ignore", "pipe", "pipe", "pipe", "pipe"];
+    const profileDir = profileDirFromArgs(this.#browserArgs);
+    await reapOrphanedBrowser(profileDir);
     this.#child = spawn(this.#browserPath, [...this.#browserArgs, "--remote-debugging-pipe"], {
+      detached: browserSpawnDetached,
       ...this.#spawnOptions,
       stdio,
     });
+    const browserPid = this.#child.pid;
+    this.#child.once("exit", () => removeBrowserPidFile(profileDir, browserPid));
     this.#stdioTail = "";
     for (const stream of [this.#child.stdout, this.#child.stderr]) {
       if (!stream) continue;
@@ -98,6 +111,7 @@ export class PipeCdpClient {
       this.transportEvents.emit("disconnected").catch(() => {});
     });
     this.#connected = true;
+    await writeBrowserPidFile(profileDir, browserPid);
     await this.#awaitReady();
     await this.send("Target.setDiscoverTargets", { discover: true }).catch(() => {});
     await this.transportEvents.emit("connected");
@@ -182,10 +196,7 @@ export class PipeCdpClient {
           new Promise(resolve => setTimeout(resolve, GRACEFUL_CLOSE_TIMEOUT_MS)),
         ]);
       }
-      if (child.exitCode === null) {
-        try { child.kill("SIGKILL"); } catch {}
-        await exited;
-      }
+      await terminateChild(child);
       return;
     }
     this.#connected = false;
