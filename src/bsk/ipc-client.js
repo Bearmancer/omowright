@@ -59,10 +59,11 @@ function rustStrHash(...values) {
   return ((v0 ^ v1 ^ v2 ^ v3) & mask).toString(16).padStart(16, "0");
 }
 
-// Node's existsSync cannot see a named pipe, so on Windows the pipe namespace is listed instead.
+// Node's existsSync cannot see a named pipe, so on Windows the pipe namespace is listed instead;
+// a listing that fails counts as no pipe, so discovery falls back to starting the daemon.
 function socketExists(sockPath) {
   if (process.platform !== "win32") return existsSync(sockPath);
-  return readdirSync("\\\\.\\pipe\\").includes(path.win32.basename(sockPath));
+  try { return readdirSync("\\\\.\\pipe\\").includes(path.win32.basename(sockPath)); } catch { return false; }
 }
 
 // True when something answers system.ping on `sockPath`: a live daemon whose daemon.json was lost.
