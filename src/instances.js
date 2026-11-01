@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { profileDirFromArgs, terminateChild } from "./browser-process.js";
 import { openConnection } from "./connection.js";
 import { isPidAlive, unlinkIfPresent, withLock } from "./instance-lock.js";
 import {
@@ -222,37 +223,6 @@ async function removeOwnedRecord(recordPath, name, pid) {
   await unlinkIfPresent(recordPath);
 }
 
-function profileDirFromArgs(browserArgs) {
-  for (let index = 0; index < browserArgs.length; index += 1) {
-    const argument = browserArgs[index];
-    if (argument === "--user-data-dir" && browserArgs[index + 1]) {
-      return path.resolve(browserArgs[index + 1]);
-    }
-    if (argument.startsWith("--user-data-dir=")) {
-      return path.resolve(argument.slice("--user-data-dir=".length));
-    }
-  }
-  return null;
-}
-
-async function terminateBrowser(child) {
-  if (!child || child.exitCode !== null || child.signalCode !== null) return;
-  const exited = new Promise((resolve) => child.once("exit", resolve));
-  child.kill("SIGTERM");
-  let forceTimer;
-  const force = new Promise((resolve) => {
-    forceTimer = setTimeout(() => {
-      if (child.exitCode === null && child.signalCode === null) {
-        child.kill("SIGKILL");
-      }
-      resolve();
-    }, 5_000);
-  });
-  await Promise.race([exited, force]);
-  clearTimeout(forceTimer);
-  if (child.exitCode === null && child.signalCode === null) await exited;
-}
-
 function connectionOptions(options, profileDir) {
   const result = { ...(options.connectionOptions ?? {}) };
   if (options.storageRoot !== undefined) result.storageRoot = options.storageRoot;
@@ -341,7 +311,7 @@ async function launchNamed(
       } catch (error) {
         failure = error;
       }
-      await terminateBrowser(child);
+      await terminateChild(child);
       // The browser this record points at is gone, so the record goes with it
       // instead of waiting for the next caller to clean it up.
       try {
@@ -356,7 +326,7 @@ async function launchNamed(
     return connection;
   } catch (error) {
     await connection?.close().catch(() => {});
-    await terminateBrowser(child);
+    await terminateChild(child);
     throw error;
   }
 }
