@@ -110,8 +110,17 @@ export class PipeCdpClient {
       this.#failAll(Error("CDP pipe browser exited"));
       this.transportEvents.emit("disconnected").catch(() => {});
     });
+    try {
+      await writeBrowserPidFile(profileDir, browserPid);
+    } catch (error) {
+      // Never leave a browser the caller holds no handle to: quit it (SIGTERM,
+      // then the bounded grace) before reporting the launch failure.
+      const child = this.#child;
+      this.#child = undefined;
+      await terminateChild(child);
+      throw error;
+    }
     this.#connected = true;
-    await writeBrowserPidFile(profileDir, browserPid);
     await this.#awaitReady();
     await this.send("Target.setDiscoverTargets", { discover: true }).catch(() => {});
     await this.transportEvents.emit("connected");

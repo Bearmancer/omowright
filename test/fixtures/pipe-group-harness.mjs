@@ -3,11 +3,12 @@
 // `timeout -s KILL` ends a caller, and checks that the browser is not in that group.
 import { PipeCdpClient } from "../../src/pipe.js";
 
-const [fixture] = process.argv.slice(2);
+// Extra argv after the fixture is passed to the browser (e.g. --user-data-dir=...).
+const [fixture, ...browserArgs] = process.argv.slice(2);
 const client = new PipeCdpClient({
   browserPath: process.execPath,
-  browserArgs: [fixture],
-  spawnOptions: { env: { ...process.env, FAKE_ON_TERM: "exit" } },
+  browserArgs: [fixture, ...browserArgs],
+  spawnOptions: { env: { FAKE_ON_TERM: "exit", ...process.env } },
 });
 await client.ensureConnected();
 process.stdout.write(`BROWSER_PID ${client.childProcess.pid}\n`);

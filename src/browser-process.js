@@ -2,7 +2,7 @@
 // state (the macOS code-sign clone of the app bundle, a temp profile) only when
 // it quits cleanly, so nothing here sends SIGKILL before a SIGTERM and a bounded
 // grace window (omo#12067).
-import { readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { isPidAlive } from "./instance-lock.js";
@@ -45,10 +45,15 @@ function pidFilePath(profileDir) {
   return path.join(profileDir, PID_FILE_NAME);
 }
 
+// Records the browser and the caller that owns it. The profile dir is created
+// first: the pidfile is written right after spawn, before Chrome has made its
+// --user-data-dir (Chrome itself is happy with a dir that already exists).
 export async function writeBrowserPidFile(profileDir, pid) {
   if (!profileDir || !pid) return;
-  const start = await processStartTime(pid);
-  writeFileSync(pidFilePath(profileDir), `${JSON.stringify({ pid, start, profileDir })}\n`, { mode: 0o600 });
+  const [start, ownerStart] = await Promise.all([processStartTime(pid), processStartTime(process.pid)]);
+  mkdirSync(profileDir, { recursive: true });
+  const record = { pid, start, profileDir, owner: { pid: process.pid, start: ownerStart } };
+  writeFileSync(pidFilePath(profileDir), `${JSON.stringify(record)}\n`, { mode: 0o600 });
 }
 
 export function removeBrowserPidFile(profileDir, pid) {
@@ -62,9 +67,23 @@ export function removeBrowserPidFile(profileDir, pid) {
   rmSync(pidFilePath(profileDir), { force: true });
 }
 
+// Same process as when recorded: alive, and (when a start time was recorded and
+// can be read now) the same start time, so a recycled pid does not count.
+// Returns null when the answer cannot be determined.
+async function sameProcessAlive(pid, start) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  if (!isPidAlive(pid)) return false;
+  if (start === null || start === undefined) return null;
+  const now = await processStartTime(pid);
+  if (now === null) return null;
+  return now === start;
+}
+
 // A pidfile left in the profile names a browser whose caller died without
 // close(). Give it the same SIGTERM-then-grace treatment before reusing the
-// profile. The recorded start time guards against a recycled pid.
+// profile. Every doubt fails toward keeping the browser: it is reaped only when
+// it is provably the recorded process AND its recorded caller is provably gone,
+// so a live client's browser on the same profile is never touched.
 export async function reapOrphanedBrowser(profileDir) {
   if (!profileDir) return;
   let recorded;
@@ -73,15 +92,20 @@ export async function reapOrphanedBrowser(profileDir) {
   } catch {
     return;
   }
-  const { pid, start } = recorded;
-  if (Number.isInteger(pid) && pid > 0 && pid !== process.pid && isPidAlive(pid)
-    && start !== null && start === await processStartTime(pid)) {
-    try { process.kill(pid, "SIGTERM"); } catch {}
-    const deadline = Date.now() + TERM_GRACE_MS;
-    while (isPidAlive(pid) && Date.now() < deadline) await sleep(REAP_POLL_MS);
-    if (isPidAlive(pid)) {
-      try { process.kill(pid, "SIGKILL"); } catch {}
-    }
+  const { pid, start, owner } = recorded;
+  const browserAlive = Number.isInteger(pid) && pid > 0 ? await sameProcessAlive(pid, start) : false;
+  if (browserAlive === false) {
+    rmSync(pidFilePath(profileDir), { force: true });
+    return;
+  }
+  if (browserAlive === null || pid === process.pid) return;
+  const ownerAlive = await sameProcessAlive(owner?.pid, owner?.start);
+  if (ownerAlive !== false) return;
+  try { process.kill(pid, "SIGTERM"); } catch {}
+  const deadline = Date.now() + TERM_GRACE_MS;
+  while (isPidAlive(pid) && Date.now() < deadline) await sleep(REAP_POLL_MS);
+  if (isPidAlive(pid)) {
+    try { process.kill(pid, "SIGKILL"); } catch {}
   }
   rmSync(pidFilePath(profileDir), { force: true });
 }

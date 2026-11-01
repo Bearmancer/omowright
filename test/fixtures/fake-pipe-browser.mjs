@@ -5,6 +5,8 @@
 // FAKE_SIGNAL_LOG names a file that receives one line per lifecycle event
 // ("TERM <epoch ms>", "EOF <epoch ms>"); FAKE_ON_TERM=ignore keeps running
 // after SIGTERM (a browser stuck mid-quit), FAKE_ON_TERM=exit quits cleanly.
+// FAKE_ON_EOF=ignore keeps running after its CDP pipe closes (a browser that
+// outlives its dead caller: the orphan a later launch must reap).
 import { appendFileSync, createReadStream, createWriteStream } from "node:fs";
 import { Socket } from "node:net";
 
@@ -52,6 +54,7 @@ if (mode === "mute-cdp") {
   });
   input.on("end", () => {
     record("EOF");
-    process.exit(0);
+    if (process.env.FAKE_ON_EOF === "ignore") setInterval(() => {}, 60_000);
+    else process.exit(0);
   });
 }
